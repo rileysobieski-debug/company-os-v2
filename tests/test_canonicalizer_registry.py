@@ -187,10 +187,17 @@ class TestStubV02Canonicalization:
             base = _canonical_bytes(verdict, exclude_verdict_hash=exclude_verdict_hash)
             return base + b"|v0.2-stub"
 
-        default_canonicalizer_registry.register("companyos-verdict/0.2", _stub_canonicalize)
+        # Snapshot any existing registration (oracle.py registers the real
+        # 0.2 canonicalizer at import time as of B1-a+b) so teardown restores
+        # it. Removing outright would leak test state into downstream tests
+        # that depend on the real v0.2 registration.
+        prior = default_canonicalizer_registry._registry.get("companyos-verdict/0.2")
+        default_canonicalizer_registry._registry["companyos-verdict/0.2"] = _stub_canonicalize
         yield
-        # Cleanup: remove 0.2 so it does not pollute other tests.
-        default_canonicalizer_registry._registry.pop("companyos-verdict/0.2", None)
+        if prior is not None:
+            default_canonicalizer_registry._registry["companyos-verdict/0.2"] = prior
+        else:
+            default_canonicalizer_registry._registry.pop("companyos-verdict/0.2", None)
 
     def _build_v02_verdict(self, keypair: Ed25519Keypair) -> OracleVerdict:
         """Build a verdict signed with the 0.2 stub canonicalizer.
