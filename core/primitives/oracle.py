@@ -52,6 +52,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Literal, get_args
 
@@ -63,6 +64,8 @@ from core.primitives.identity import (
     sign as _identity_sign,
     verify as _identity_verify,
 )
+from core.primitives.sla import InterOrgSLA
+from core.primitives.state import FOUNDER_PRINCIPALS
 
 # ---------------------------------------------------------------------------
 # Literal types
@@ -442,4 +445,169 @@ __all__ = [
     "OracleResult",
     "EvidenceKind",
     "OracleVerdict",
+    "Oracle",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Private helpers (used by Oracle below)
+# ---------------------------------------------------------------------------
+def _datetime_now_utc_z() -> str:
+    """Return the current UTC time as a canonical Z-suffix ISO string."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ---------------------------------------------------------------------------
+# Oracle
+# ---------------------------------------------------------------------------
+class Oracle:
+    """Evaluation node that issues signed OracleVerdicts.
+
+    v1a supports two tiers:
+      - Tier 0: deterministic JSON Schema validation via SchemaVerifier.
+      - Tier 3: founder arbitration override (supersedes any prior verdict).
+
+    Attributes
+    ----------
+    node_did:
+        The DID of the node on which this Oracle instance is running.
+        Stamped into `evaluator_did` on every verdict produced here.
+    node_keypair:
+        The Ed25519 keypair of this node. Used to sign Tier 0 verdicts.
+        Tier 3 verdicts are signed with the founder's keypair instead,
+        but `node_did` is still recorded as `evaluator_did`.
+    schema_verifier:
+        A SchemaVerifier instance (or any object with a compatible
+        `verify(sla, artifact_bytes, *, artifact_properties)` method).
+    """
+
+    def __init__(
+        self,
+        node_did: str,
+        node_keypair: Ed25519Keypair,
+        schema_verifier: "SchemaVerifier",
+    ) -> None:
+        if not isinstance(node_did, str) or not node_did.strip():
+            raise ValueError("node_did must be a non-empty string")
+        if not isinstance(node_keypair, Ed25519Keypair):
+            raise TypeError(
+                f"node_keypair must be an Ed25519Keypair, "
+                f"got {type(node_keypair).__name__}"
+            )
+        self.node_did = node_did
+        self.node_keypair = node_keypair
+        self.schema_verifier = schema_verifier
+
+    def evaluate_tier0(
+        self,
+        sla: "InterOrgSLA",
+        artifact_bytes: bytes,
+        *,
+        artifact_properties: dict | None = None,
+    ) -> OracleVerdict:
+        """Run Tier 0 (schema) evaluation and return a signed verdict.
+
+        Delegates to `self.schema_verifier.verify`, wraps the returned
+        `(result, evidence)` tuple in an `OracleVerdict` with `tier=0`,
+        and signs it with `self.node_keypair`.
+
+        Parameters
+        ----------
+        sla:
+            The InterOrgSLA governing this delivery. Its
+            `artifact_hash_at_delivery` must already be populated via
+            `sla.with_delivery_hash(...)`.
+        artifact_bytes:
+            Raw bytes of the delivered artifact.
+        artifact_properties:
+            Optional dict for binary artifacts. Passed through to
+            `SchemaVerifier.verify` unchanged.
+
+        Returns
+        -------
+        OracleVerdict
+            A signed Tier 0 verdict. `evaluator_did` is `self.node_did`.
+        """
+        result, evidence = self.schema_verifier.verify(
+            sla, artifact_bytes, artifact_properties=artifact_properties
+        )
+        artifact_hash = hashlib.sha256(artifact_bytes).hexdigest()
+        issued_at = _datetime_now_utc_z()
+        return OracleVerdict.create(
+            sla_id=sla.sla_id,
+            artifact_hash=artifact_hash,
+            tier=0,
+            result=result,
+            evaluator_did=self.node_did,
+            evidence=evidence,
+            issued_at=issued_at,
+            keypair=self.node_keypair,
+        )
+
+    def founder_override(
+        self,
+        prior_verdict: OracleVerdict,
+        result: OracleResult,
+        reason: str,
+        founder_keypair: Ed25519Keypair,
+        *,
+        founder_identity: str,
+    ) -> OracleVerdict:
+        """Issue a Tier 3 founder-arbitration verdict that supersedes a prior verdict.
+
+        The prior verdict's `artifact_hash` and `sla_id` are carried forward.
+        The verdict is signed by `founder_keypair`, not `self.node_keypair`,
+        so the cryptographic signer is the founder. `evaluator_did` is still
+        `self.node_did` (the node processing the override).
+
+        Parameters
+        ----------
+        prior_verdict:
+            The verdict being overridden. Its `verdict_hash` is recorded
+            in `evidence.overrides` for auditability.
+        result:
+            The new result to assert (e.g. "accepted" to reverse a rejection).
+        reason:
+            A non-empty human-readable rationale for the override.
+        founder_keypair:
+            The founder's Ed25519 keypair. Used to sign the verdict.
+        founder_identity:
+            A string identity claim checked against `FOUNDER_PRINCIPALS`.
+            Raises `SignatureError` if not present in that set.
+
+        Returns
+        -------
+        OracleVerdict
+            A signed Tier 3 verdict with `evidence.kind="founder_override"`.
+
+        Raises
+        ------
+        ValueError
+            If `reason` is empty or whitespace-only.
+        SignatureError
+            If `founder_identity` is not in FOUNDER_PRINCIPALS.
+        """
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("reason must be a non-empty string")
+        if founder_identity not in FOUNDER_PRINCIPALS:
+            raise SignatureError(
+                f"non-founder identity: {founder_identity!r}"
+            )
+        issued_at = _datetime_now_utc_z()
+        evidence = {
+            "kind": "founder_override",
+            "overrides": prior_verdict.verdict_hash,
+            "reason": reason,
+            "founder_identity": founder_identity,
+        }
+        return OracleVerdict.create(
+            sla_id=prior_verdict.sla_id,
+            artifact_hash=prior_verdict.artifact_hash,
+            tier=3,
+            result=result,
+            evaluator_did=self.node_did,
+            evidence=evidence,
+            issued_at=issued_at,
+            keypair=founder_keypair,
+        )
+
