@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any, Literal, NewType, Protocol, runtime_check
 if TYPE_CHECKING:  # pragma: no cover — type-check only
     from core.primitives.asset import AssetRef       # Ticket 1
     from core.primitives.money import Money          # Ticket 2
+    from core.primitives.oracle import OracleVerdict  # A2
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +215,40 @@ class SettlementAdapter(Protocol):
 
     def get_status(self, handle: EscrowHandle) -> EscrowStatus:
         """Observed lifecycle state of `handle`. Raises EscrowStateError on unknown."""
+        ...
+
+    def release_pending_verdict(
+        self,
+        handle: EscrowHandle,
+        verdict: "OracleVerdict",
+        *,
+        expected_artifact_hash: str,
+        requester_did: str,
+        provider_did: str,
+    ) -> SettlementReceipt:
+        """Settle an escrow based on a signed `OracleVerdict`.
+
+        Enforces:
+        - `verdict.sla_id == handle.ref` (mismatched SLA raises VerdictError).
+        - `verdict.verify_signature()` passes (tampered verdict raises
+          SignatureError).
+        - `verdict.artifact_hash == expected_artifact_hash` (hash binding raises
+          VerdictError on mismatch).
+
+        Result dispatch:
+        - `accepted`  -> release escrow to `provider_did`.
+        - `rejected`  -> 100% slash to `requester_did` as beneficiary.
+        - `refunded`  -> return escrow to the original locker, no slash.
+
+        Emits a `verdict_issued` ledger event before the settlement event.
+        For Tier 3 `founder_override` verdicts also emits `founder_override`.
+
+        Raises:
+            VerdictError: sla_id mismatch, artifact_hash mismatch, or
+                double-verdict without a valid Tier 3 override.
+            SignatureError: cryptographic verification failure.
+            EscrowStateError: escrow not in `locked` state.
+        """
         ...
 
 

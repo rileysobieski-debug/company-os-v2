@@ -39,6 +39,7 @@ from core.primitives.asset import AssetRef
 from core.primitives.exceptions import (
     EscrowStateError,
     UnsupportedAssetError,
+    VerdictError,
 )
 from core.primitives.money import Money
 from core.primitives.settlement_adapters.base import (
@@ -209,26 +210,17 @@ class MockSettlementAdapter:
     # ------------------------------------------------------------------
     def release(self, handle: EscrowHandle, to: str) -> SettlementReceipt:
         """Release the escrow to principal `to`. Credits their balance."""
+        # Fetch locker for metadata before _do_release mutates status.
         record = self.escrows.get(handle.handle_id)
         if record is None:
             raise EscrowStateError(
                 f"unknown escrow handle {handle.handle_id!r}"
             )
-        if record.status != "locked":
-            raise EscrowStateError(
-                f"cannot release escrow {handle.handle_id!r} in state "
-                f"{record.status!r}"
-            )
-
+        locker = record.locker
         amount = record.handle.locked_amount
         asset = record.handle.asset
 
-        # Credit destination principal.
-        dest_key = (to, asset.asset_id)
-        current = self.balances.get(dest_key, Money.zero(asset))
-        self.balances[dest_key] = current + amount
-
-        record.status = "released"
+        self._do_release(handle, to=to)
 
         receipt = SettlementReceipt(
             handle_id=handle.handle_id,
@@ -245,7 +237,7 @@ class MockSettlementAdapter:
             amount_quantity_str=str(amount.quantity),
             sla_id=handle.ref,
             outcome_receipt=receipt.to_dict(),
-            metadata={"locker": record.locker, "to": to},
+            metadata={"locker": locker, "to": to},
         )
         return receipt
 
@@ -276,6 +268,7 @@ class MockSettlementAdapter:
         if not (0 <= percent <= 100):
             raise ValueError(f"slash percent must be in [0, 100], got {percent}")
 
+        locker = record.locker
         amount = record.handle.locked_amount
         asset = record.handle.asset
 
@@ -292,11 +285,12 @@ class MockSettlementAdapter:
         self.balances[locker_key] = locker_bal + remainder_amount
 
         if beneficiary is None:
+            # Burn path: slashed fraction is destroyed (no credit).
             transferred = Money.zero(asset)
             burned = slashed_amount
             to = ""
         else:
-            # Credit beneficiary's balance.
+            # Transfer path: credit beneficiary's balance.
             ben_key = (beneficiary, asset.asset_id)
             ben_bal = self.balances.get(ben_key, Money.zero(asset))
             self.balances[ben_key] = ben_bal + slashed_amount
@@ -322,11 +316,333 @@ class MockSettlementAdapter:
             sla_id=handle.ref,
             outcome_receipt=receipt.to_dict(),
             metadata={
-                "locker": record.locker,
+                "locker": locker,
                 "beneficiary": beneficiary or "",
                 "percent": percent,
             },
         )
+        return receipt
+
+    # ------------------------------------------------------------------
+    # Private transfer helpers (shared by release, slash, and
+    # release_pending_verdict so verdict-kinded events can be emitted
+    # separately from the balance movement).
+    # ------------------------------------------------------------------
+    def _do_release(self, handle: EscrowHandle, to: str) -> None:
+        """Credit `to` with the locked amount; mark escrow released.
+
+        Does NOT emit any ledger event. Callers are responsible for emitting
+        the appropriate event after calling this helper.
+
+        Raises:
+            EscrowStateError: handle unknown or not in `locked` state.
+        """
+        record = self.escrows.get(handle.handle_id)
+        if record is None:
+            raise EscrowStateError(
+                f"unknown escrow handle {handle.handle_id!r}"
+            )
+        if record.status != "locked":
+            raise EscrowStateError(
+                f"cannot release escrow {handle.handle_id!r} in state "
+                f"{record.status!r}"
+            )
+        amount = record.handle.locked_amount
+        asset = record.handle.asset
+        dest_key = (to, asset.asset_id)
+        current = self.balances.get(dest_key, Money.zero(asset))
+        self.balances[dest_key] = current + amount
+        record.status = "released"
+
+    def _do_transfer_to(
+        self,
+        handle: EscrowHandle,
+        to: str,
+        *,
+        percent: int = 100,
+    ) -> None:
+        """Transfer `percent`% of locked funds to `to`; remainder to locker.
+
+        Does NOT emit any ledger event. Callers are responsible for emitting
+        the appropriate event. Marks the escrow as `slashed`.
+
+        Raises:
+            EscrowStateError: handle unknown or not in `locked` state.
+            ValueError: percent not in [0, 100].
+        """
+        record = self.escrows.get(handle.handle_id)
+        if record is None:
+            raise EscrowStateError(
+                f"unknown escrow handle {handle.handle_id!r}"
+            )
+        if record.status != "locked":
+            raise EscrowStateError(
+                f"cannot slash escrow {handle.handle_id!r} in state "
+                f"{record.status!r}"
+            )
+        if not (0 <= percent <= 100):
+            raise ValueError(f"slash percent must be in [0, 100], got {percent}")
+
+        from decimal import Decimal
+        amount = record.handle.locked_amount
+        asset = record.handle.asset
+        slashed_fraction = Decimal(percent) / Decimal(100)
+        remainder_fraction = Decimal(100 - percent) / Decimal(100)
+        slashed_amount = amount * slashed_fraction
+        remainder_amount = amount * remainder_fraction
+
+        # Remainder back to locker.
+        locker_key = (record.locker, asset.asset_id)
+        locker_bal = self.balances.get(locker_key, Money.zero(asset))
+        self.balances[locker_key] = locker_bal + remainder_amount
+
+        # Slashed fraction to `to`.
+        dest_key = (to, asset.asset_id)
+        dest_bal = self.balances.get(dest_key, Money.zero(asset))
+        self.balances[dest_key] = dest_bal + slashed_amount
+
+        record.status = "slashed"
+
+    def _do_release_to_locker(self, handle: EscrowHandle) -> None:
+        """Return the full locked amount back to the original locker.
+
+        Used for the `refunded` result path: no slash, no penalty.
+        Does NOT emit any ledger event.
+
+        Raises:
+            EscrowStateError: handle unknown or not in `locked` state.
+        """
+        record = self.escrows.get(handle.handle_id)
+        if record is None:
+            raise EscrowStateError(
+                f"unknown escrow handle {handle.handle_id!r}"
+            )
+        if record.status != "locked":
+            raise EscrowStateError(
+                f"cannot refund escrow {handle.handle_id!r} in state "
+                f"{record.status!r}"
+            )
+        amount = record.handle.locked_amount
+        asset = record.handle.asset
+        locker_key = (record.locker, asset.asset_id)
+        locker_bal = self.balances.get(locker_key, Money.zero(asset))
+        self.balances[locker_key] = locker_bal + amount
+        record.status = "released"
+
+    # ------------------------------------------------------------------
+    # release_pending_verdict (Ticket A5)
+    # ------------------------------------------------------------------
+    def release_pending_verdict(
+        self,
+        handle: EscrowHandle,
+        verdict: Any,
+        *,
+        expected_artifact_hash: str,
+        requester_did: str,
+        provider_did: str,
+    ) -> SettlementReceipt:
+        """Settle an escrow based on a signed OracleVerdict.
+
+        Enforces sla_id binding, signature validity, artifact hash binding,
+        and double-verdict prevention. Emits verdict_issued (and optionally
+        founder_override) before the settlement event.
+
+        Parameters
+        ----------
+        handle:
+            Escrow handle returned from `lock`.
+        verdict:
+            Signed OracleVerdict from the oracle pipeline.
+        expected_artifact_hash:
+            The SLA's `artifact_hash_at_delivery`. Must match
+            `verdict.artifact_hash`.
+        requester_did:
+            DID of the requester (used as beneficiary on rejection, and
+            recorded in ledger events).
+        provider_did:
+            DID of the provider (credited on acceptance).
+
+        Returns
+        -------
+        SettlementReceipt
+            Final settlement record.
+
+        Raises
+        ------
+        VerdictError:
+            sla_id mismatch, artifact_hash mismatch, or double-verdict
+            without a valid Tier 3 founder override.
+        SignatureError:
+            Cryptographic verification failed.
+        EscrowStateError:
+            Escrow not in `locked` state.
+        """
+        # --- guard: sla_id binding -----------------------------------------
+        if verdict.sla_id != handle.ref:
+            raise VerdictError(
+                f"verdict sla_id {verdict.sla_id!r} does not match "
+                f"escrow ref {handle.ref!r}"
+            )
+
+        # --- guard: signature -----------------------------------------------
+        verdict.verify_signature()  # raises SignatureError on failure
+
+        # --- guard: artifact hash binding ------------------------------------
+        if verdict.artifact_hash != expected_artifact_hash:
+            raise VerdictError(
+                f"artifact hash mismatch: verdict={verdict.artifact_hash!r}, "
+                f"expected={expected_artifact_hash!r}"
+            )
+
+        # --- guard: double-verdict ------------------------------------------
+        sla_id = handle.ref
+        if self._ledger is not None:
+            prior_verdict_events = [
+                ev
+                for ev in self._ledger.events()
+                if ev.kind == "verdict_issued" and ev.sla_id == sla_id
+            ]
+            if prior_verdict_events:
+                # Allow only a Tier 3 founder override that references the
+                # prior verdict's hash via evidence.overrides.
+                is_override = (
+                    verdict.tier == 3
+                    and verdict.evidence.get("kind") == "founder_override"
+                    and verdict.evidence.get("overrides") in {
+                        ev.metadata.get("verdict_hash")
+                        for ev in prior_verdict_events
+                    }
+                )
+                if not is_override:
+                    raise VerdictError(
+                        f"verdict already issued for sla_id {sla_id!r}"
+                    )
+
+        # --- record is fetched for receipt construction below ---------------
+        record = self.escrows.get(handle.handle_id)
+        if record is None:
+            raise EscrowStateError(
+                f"unknown escrow handle {handle.handle_id!r}"
+            )
+
+        amount = record.handle.locked_amount
+        asset = record.handle.asset
+
+        # --- emit verdict_issued event first --------------------------------
+        verdict_meta: dict = {
+            "verdict_hash": verdict.verdict_hash,
+            "tier": verdict.tier,
+            "result": verdict.result,
+            "evaluator_did": verdict.evaluator_did,
+            "evidence_kind": verdict.evidence.get("kind", ""),
+        }
+        if verdict.tier == 3:
+            verdict_meta["overrides"] = verdict.evidence.get("overrides", "")
+
+        self._record_event(
+            kind="verdict_issued",
+            handle_id=str(handle.handle_id),
+            asset_id=asset.asset_id,
+            amount_quantity_str=str(amount.quantity),
+            sla_id=sla_id,
+            outcome_receipt=None,
+            metadata=dict(verdict_meta, requester_did=requester_did, provider_did=provider_did),
+        )
+
+        # --- emit founder_override event for Tier 3 overrides ---------------
+        if (
+            verdict.tier == 3
+            and verdict.evidence.get("kind") == "founder_override"
+        ):
+            self._record_event(
+                kind="founder_override",
+                handle_id=str(handle.handle_id),
+                asset_id=asset.asset_id,
+                amount_quantity_str=str(amount.quantity),
+                sla_id=sla_id,
+                outcome_receipt=None,
+                metadata={
+                    "founder_identity": verdict.evidence.get("founder_identity", ""),
+                    "reason": verdict.evidence.get("reason", ""),
+                    "overrides": verdict.evidence.get("overrides", ""),
+                },
+            )
+
+        # --- perform settlement based on result -----------------------------
+        result = verdict.result
+
+        if result == "accepted":
+            self._do_release(handle, to=provider_did)
+            receipt = SettlementReceipt(
+                handle_id=handle.handle_id,
+                outcome="released",
+                to=provider_did,
+                transferred=amount,
+                burned=Money.zero(asset),
+                ts=_utc_z_now(),
+            )
+            self._record_event(
+                kind="release_from_verdict",
+                handle_id=str(handle.handle_id),
+                asset_id=asset.asset_id,
+                amount_quantity_str=str(amount.quantity),
+                sla_id=sla_id,
+                outcome_receipt=receipt.to_dict(),
+                metadata={
+                    "requester_did": requester_did,
+                    "provider_did": provider_did,
+                    "verdict_hash": verdict.verdict_hash,
+                },
+            )
+
+        elif result == "rejected":
+            self._do_transfer_to(handle, to=requester_did, percent=100)
+            receipt = SettlementReceipt(
+                handle_id=handle.handle_id,
+                outcome="slashed",
+                to=requester_did,
+                transferred=amount,
+                burned=Money.zero(asset),
+                ts=_utc_z_now(),
+            )
+            self._record_event(
+                kind="slash_from_verdict",
+                handle_id=str(handle.handle_id),
+                asset_id=asset.asset_id,
+                amount_quantity_str=str(amount.quantity),
+                sla_id=sla_id,
+                outcome_receipt=receipt.to_dict(),
+                metadata={
+                    "requester_did": requester_did,
+                    "provider_did": provider_did,
+                    "verdict_hash": verdict.verdict_hash,
+                },
+            )
+
+        else:  # refunded
+            self._do_release_to_locker(handle)
+            receipt = SettlementReceipt(
+                handle_id=handle.handle_id,
+                outcome="released",
+                to=record.locker,
+                transferred=amount,
+                burned=Money.zero(asset),
+                ts=_utc_z_now(),
+            )
+            self._record_event(
+                kind="refund_from_verdict",
+                handle_id=str(handle.handle_id),
+                asset_id=asset.asset_id,
+                amount_quantity_str=str(amount.quantity),
+                sla_id=sla_id,
+                outcome_receipt=receipt.to_dict(),
+                metadata={
+                    "requester_did": requester_did,
+                    "provider_did": provider_did,
+                    "verdict_hash": verdict.verdict_hash,
+                },
+            )
+
         return receipt
 
     # ------------------------------------------------------------------

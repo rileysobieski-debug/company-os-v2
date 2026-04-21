@@ -23,6 +23,8 @@ implementation comes later.
 """
 from __future__ import annotations
 
+from typing import Any
+
 from core.primitives.asset import AssetRef
 from core.primitives.money import Money
 from core.primitives.settlement_adapters.base import (
@@ -99,6 +101,19 @@ class StablecoinStubAdapter:
 
     def get_status(self, handle: EscrowHandle) -> EscrowStatus:
         raise NotImplementedError(_NOT_IMPL_MSG)
+
+    def release_pending_verdict(
+        self,
+        handle: EscrowHandle,
+        verdict: Any,
+        *,
+        expected_artifact_hash: str,
+        requester_did: str,
+        provider_did: str,
+    ) -> SettlementReceipt:
+        raise NotImplementedError(
+            "release_pending_verdict not implemented on stablecoin stub"
+        )
 
 
 __all__ = ["StablecoinStubAdapter"]

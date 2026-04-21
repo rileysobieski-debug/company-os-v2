@@ -64,7 +64,16 @@ from typing import Any, Iterator, Literal, Optional
 
 LEDGER_FILENAME = "events.jsonl"
 
-EventKind = Literal["lock", "release", "slash"]
+EventKind = Literal[
+    "lock",
+    "release",
+    "slash",
+    "verdict_issued",
+    "release_from_verdict",
+    "slash_from_verdict",
+    "refund_from_verdict",
+    "founder_override",
+]
 
 
 def _utc_z_now() -> str:
@@ -292,6 +301,12 @@ class SettlementEventLedger:
                 if not isinstance(obj, dict):
                     continue
                 yield _event_from_dict(obj)
+
+    def events(self) -> Iterator[SettlementEvent]:
+        """Alias for `iter_events`. Exposes the backing event list for
+        callers that prefer the shorter name (e.g. the settlement adapter
+        scanning for prior verdicts)."""
+        return self.iter_events()
 
     def load_all(self) -> list[SettlementEvent]:
         return list(self.iter_events())

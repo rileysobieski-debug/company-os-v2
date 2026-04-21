@@ -297,6 +297,28 @@ def test_mock_no_ledger_default_behavior_unchanged(asset_registry, tmp_path: Pat
     assert list(tmp_path.iterdir()) == []
 
 
+def test_new_event_kinds_roundtrip_through_jsonl(tmp_path: Path):
+    """A5: all new EventKind values survive a JSONL write + reload cycle."""
+    new_kinds = [
+        "verdict_issued",
+        "release_from_verdict",
+        "slash_from_verdict",
+        "refund_from_verdict",
+        "founder_override",
+    ]
+    ledger = SettlementEventLedger(tmp_path)
+    for kind in new_kinds:
+        ev = _make_event(kind=kind, handle_id=f"h-{kind}")
+        ledger.record(ev)
+
+    loaded = ledger.load_all()
+    assert len(loaded) == len(new_kinds)
+    for original_kind, ev in zip(new_kinds, loaded):
+        assert ev.kind == original_kind, (
+            f"Expected kind {original_kind!r}, got {ev.kind!r}"
+        )
+
+
 def test_mock_principals_are_blank_by_default(asset_registry, tmp_path: Path):
     """Ticket 9 Option B: the mock adapter does not know DIDs, so it
     writes blanks. Ticket 6 will override via richer metadata."""
