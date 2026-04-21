@@ -82,6 +82,37 @@ class SignatureError(SettlementError):
     """
 
 
+class VerdictError(SettlementError):
+    """A Tier 0 / Tier 3 oracle verdict failed a structural or binding
+    check.
+
+    Raised when `SettlementAdapter.release_pending_verdict` refuses to
+    act on a verdict because (a) the verdict's `sla_id` does not match
+    the escrow handle's ref, (b) a verdict has already been issued
+    against this SLA and the caller is not presenting a Tier 3 founder
+    override, (c) the evidence kind is unknown at deserialization time,
+    or (d) any other structural violation short of a bad signature
+    (which is `SignatureError`'s job).
+
+    Distinct from `SignatureError` so callers can recover from a replay
+    or double-issue differently from a cryptographic failure.
+    """
+
+
+class ChallengeError(SettlementError):
+    """A Tier 1 evaluator verdict was challenged outside its challenge
+    window, or a challenge carried invalid evidence.
+
+    Reserved for v1b. V1a has no Tier 1 evaluator and therefore no
+    challenge path, but the `challenge_window_sec` field on
+    `InterOrgSLA` is already canonical and forward-compat callers may
+    raise this type when they encounter a challenge against a v1a
+    adapter. V1a code never raises this; it is carried in the hierarchy
+    so downstream modules can import it without a second refactor when
+    Tier 1 ships.
+    """
+
+
 __all__ = [
     "SettlementError",
     "AssetMismatchError",
@@ -90,4 +121,6 @@ __all__ = [
     "InexactQuantizationError",
     "AdapterConflictError",
     "SignatureError",
+    "VerdictError",
+    "ChallengeError",
 ]

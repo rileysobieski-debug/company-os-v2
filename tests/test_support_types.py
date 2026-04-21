@@ -25,11 +25,13 @@ import pytest
 from core.primitives.exceptions import (
     AdapterConflictError,
     AssetMismatchError,
+    ChallengeError,
     EscrowStateError,
     InexactQuantizationError,
     SettlementError,
     SignatureError,
     UnsupportedAssetError,
+    VerdictError,
 )
 from core.primitives.settlement_adapters import (
     EscrowHandle,
@@ -257,6 +259,8 @@ class TestExceptionHierarchy:
             InexactQuantizationError,
             AdapterConflictError,
             SignatureError,
+            VerdictError,
+            ChallengeError,
         ],
     )
     def test_subclass_is_settlement_error(self, cls):
@@ -273,6 +277,8 @@ class TestExceptionHierarchy:
             InexactQuantizationError("d"),
             AdapterConflictError("e"),
             SignatureError("f"),
+            VerdictError("g"),
+            ChallengeError("h"),
         ]
         for e in errors:
             try:
@@ -290,5 +296,7 @@ class TestExceptionHierarchy:
             InexactQuantizationError,
             AdapterConflictError,
             SignatureError,
+            VerdictError,
+            ChallengeError,
         }
-        assert len(types) == 7
+        assert len(types) == 9

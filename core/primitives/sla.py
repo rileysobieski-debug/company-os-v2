@@ -216,6 +216,17 @@ def _canonical_bytes_for_binding(shell: Mapping[str, Any]) -> bytes:
 # ---------------------------------------------------------------------------
 _PROTOCOL_VERSION_DEFAULT = "companyos-sla/0.1"
 
+# v1a oracle additions (Ticket A3). Three fields are reserved for Tier 1
+# (v1b) but are canonical now so future adapters see them; one is already
+# consumed by v1a's SchemaVerifier.
+#
+# challenge_window_sec is validated at construction time. Bounds are:
+#   - 60s  : shortest meaningful window for automated systems
+#   - 604800s (7 days) : longest window before the contract stales out
+_CHALLENGE_WINDOW_SEC_MIN = 60
+_CHALLENGE_WINDOW_SEC_MAX = 604_800
+_CHALLENGE_WINDOW_SEC_DEFAULT = 86_400  # 24 hours
+
 
 @dataclass(frozen=True)
 class InterOrgSLA:
@@ -247,6 +258,17 @@ class InterOrgSLA:
     # --- defaulted ---------------------------------------------------------
     protocol_version: str = _PROTOCOL_VERSION_DEFAULT
     protocol_fee_bps: int = 0
+
+    # v1a oracle fields (Ticket A3). `artifact_hash_at_delivery` is
+    # populated by the provider at delivery time via `with_delivery_hash`;
+    # empty string at signing time is permitted. The other three are
+    # reserved for Tier 1 consumers in v1b and carried here so the
+    # canonical byte shape stabilizes before Tier 1 ships.
+    artifact_hash_at_delivery: str = ""
+    primary_evaluator_did: "str | None" = None
+    canonical_evaluator_hash: "str | None" = None
+    challenge_window_sec: int = _CHALLENGE_WINDOW_SEC_DEFAULT
+
     requester_signature: "Signature | None" = None
     provider_signature: "Signature | None" = None
 
@@ -271,6 +293,10 @@ class InterOrgSLA:
         expires_at: Any,
         protocol_fee_bps: int = 0,
         protocol_version: str = _PROTOCOL_VERSION_DEFAULT,
+        artifact_hash_at_delivery: str = "",
+        primary_evaluator_did: "str | None" = None,
+        canonical_evaluator_hash: "str | None" = None,
+        challenge_window_sec: int = _CHALLENGE_WINDOW_SEC_DEFAULT,
     ) -> "InterOrgSLA":
         """Strict factory — validates inputs, normalizes timestamps,
         computes `integrity_binding`, returns the fully-filled frozen
@@ -308,6 +334,39 @@ class InterOrgSLA:
         if not isinstance(protocol_fee_bps, int) or protocol_fee_bps < 0:
             raise ValueError("protocol_fee_bps must be a non-negative int")
 
+        # --- v1a oracle field validation ------------------------------------
+        if not isinstance(artifact_hash_at_delivery, str):
+            raise TypeError(
+                "artifact_hash_at_delivery must be a string "
+                "(empty string is permitted at signing time)"
+            )
+        if primary_evaluator_did is not None and (
+            not isinstance(primary_evaluator_did, str) or not primary_evaluator_did
+        ):
+            raise ValueError(
+                "primary_evaluator_did, when provided, must be a non-empty string"
+            )
+        if canonical_evaluator_hash is not None and (
+            not isinstance(canonical_evaluator_hash, str) or not canonical_evaluator_hash
+        ):
+            raise ValueError(
+                "canonical_evaluator_hash, when provided, must be a non-empty string"
+            )
+        if not isinstance(challenge_window_sec, int) or isinstance(
+            challenge_window_sec, bool
+        ):
+            raise TypeError("challenge_window_sec must be an int")
+        if not (
+            _CHALLENGE_WINDOW_SEC_MIN
+            <= challenge_window_sec
+            <= _CHALLENGE_WINDOW_SEC_MAX
+        ):
+            raise ValueError(
+                f"challenge_window_sec must be in "
+                f"[{_CHALLENGE_WINDOW_SEC_MIN}, {_CHALLENGE_WINDOW_SEC_MAX}], "
+                f"got {challenge_window_sec}"
+            )
+
         # --- normalize datetimes --------------------------------------------
         issued_at_str = _canonicalize_datetime(issued_at)
         expires_at_str = _canonicalize_datetime(expires_at)
@@ -328,6 +387,10 @@ class InterOrgSLA:
             "expires_at": expires_at_str,
             "protocol_version": protocol_version,
             "protocol_fee_bps": protocol_fee_bps,
+            "artifact_hash_at_delivery": artifact_hash_at_delivery,
+            "primary_evaluator_did": primary_evaluator_did,
+            "canonical_evaluator_hash": canonical_evaluator_hash,
+            "challenge_window_sec": challenge_window_sec,
         }
         body_bytes = _canonical_bytes_for_binding(shell)
         # `compute_integrity_hash` takes a `body: str`. Decode the
@@ -358,8 +421,35 @@ class InterOrgSLA:
             integrity_binding=binding,
             protocol_version=protocol_version,
             protocol_fee_bps=protocol_fee_bps,
+            artifact_hash_at_delivery=artifact_hash_at_delivery,
+            primary_evaluator_did=primary_evaluator_did,
+            canonical_evaluator_hash=canonical_evaluator_hash,
+            challenge_window_sec=challenge_window_sec,
             requester_signature=None,
             provider_signature=None,
+        )
+
+    def with_delivery_hash(self, artifact_hash: str) -> "InterOrgSLA":
+        """Return a copy of this SLA with `artifact_hash_at_delivery`
+        populated and the `integrity_binding` recomputed.
+
+        Called by the provider at delivery time to bind the delivered
+        artifact bytes to the SLA. Because `artifact_hash_at_delivery`
+        participates in canonical bytes, updating it changes the binding
+        AND invalidates any prior signatures (which sign over the old
+        binding). Callers that need re-signed proof must call
+        `sign_as_requester` / `sign_as_provider` on the returned SLA.
+
+        Raises:
+            ValueError: if `artifact_hash` is empty or not a string.
+        """
+        if not isinstance(artifact_hash, str) or not artifact_hash:
+            raise ValueError("artifact_hash must be a non-empty string")
+        with_hash = dataclasses.replace(
+            self, artifact_hash_at_delivery=artifact_hash
+        )
+        return dataclasses.replace(
+            with_hash, integrity_binding=with_hash.recompute_binding()
         )
 
     @staticmethod
@@ -570,6 +660,10 @@ class InterOrgSLA:
             "integrity_binding": self.integrity_binding,
             "protocol_version": self.protocol_version,
             "protocol_fee_bps": self.protocol_fee_bps,
+            "artifact_hash_at_delivery": self.artifact_hash_at_delivery,
+            "primary_evaluator_did": self.primary_evaluator_did,
+            "canonical_evaluator_hash": self.canonical_evaluator_hash,
+            "challenge_window_sec": self.challenge_window_sec,
             "requester_signature": (
                 self.requester_signature.to_dict()
                 if self.requester_signature is not None
@@ -626,6 +720,8 @@ class InterOrgSLA:
 
         req_sig = d.get("requester_signature")
         prov_sig = d.get("provider_signature")
+        primary_eval = d.get("primary_evaluator_did")
+        canonical_eval_hash = d.get("canonical_evaluator_hash")
         return cls(
             sla_id=str(d["sla_id"]),
             requester_node_did=str(d["requester_node_did"]),
@@ -644,6 +740,18 @@ class InterOrgSLA:
                 d.get("protocol_version", _PROTOCOL_VERSION_DEFAULT)
             ),
             protocol_fee_bps=int(d.get("protocol_fee_bps", 0)),
+            artifact_hash_at_delivery=str(d.get("artifact_hash_at_delivery", "")),
+            primary_evaluator_did=(
+                str(primary_eval) if primary_eval is not None else None
+            ),
+            canonical_evaluator_hash=(
+                str(canonical_eval_hash)
+                if canonical_eval_hash is not None
+                else None
+            ),
+            challenge_window_sec=int(
+                d.get("challenge_window_sec", _CHALLENGE_WINDOW_SEC_DEFAULT)
+            ),
             requester_signature=(
                 Signature.from_dict(req_sig) if req_sig is not None else None
             ),

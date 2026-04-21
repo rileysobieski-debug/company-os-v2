@@ -602,3 +602,180 @@ class TestSigning:
         }
         # Should not raise.
         signed.verify_signatures(registry=reg)
+
+
+# ---------------------------------------------------------------------------
+# v1a oracle fields (Ticket A3)
+# ---------------------------------------------------------------------------
+class TestV1aOracleFields:
+    """Tests for the four oracle-related fields added in v1a:
+    `artifact_hash_at_delivery`, `primary_evaluator_did`,
+    `canonical_evaluator_hash`, and `challenge_window_sec`.
+    """
+
+    def test_defaults_populated_on_create(self, usd):
+        sla = InterOrgSLA.create(**_base_kwargs(usd))
+        assert sla.artifact_hash_at_delivery == ""
+        assert sla.primary_evaluator_did is None
+        assert sla.canonical_evaluator_hash is None
+        assert sla.challenge_window_sec == 86_400
+
+    def test_artifact_hash_roundtrips_through_dict(self, usd, registry):
+        sla = InterOrgSLA.create(**_base_kwargs(usd))
+        populated = sla.with_delivery_hash("deadbeef" * 8)
+        rehydrated = InterOrgSLA.from_dict(populated.to_dict(), registry)
+        assert rehydrated.artifact_hash_at_delivery == "deadbeef" * 8
+        assert rehydrated == populated
+
+    def test_v1b_reserved_fields_roundtrip(self, usd, registry):
+        kwargs = _base_kwargs(usd)
+        kwargs["primary_evaluator_did"] = "did:companyos:judge-001"
+        kwargs["canonical_evaluator_hash"] = "a" * 64
+        kwargs["challenge_window_sec"] = 3_600
+        sla = InterOrgSLA.create(**kwargs)
+        assert sla.primary_evaluator_did == "did:companyos:judge-001"
+        assert sla.canonical_evaluator_hash == "a" * 64
+        assert sla.challenge_window_sec == 3_600
+
+        rehydrated = InterOrgSLA.from_dict(sla.to_dict(), registry)
+        assert rehydrated.primary_evaluator_did == "did:companyos:judge-001"
+        assert rehydrated.canonical_evaluator_hash == "a" * 64
+        assert rehydrated.challenge_window_sec == 3_600
+
+    def test_v1b_fields_change_integrity_binding(self, usd):
+        """Adding primary_evaluator_did or canonical_evaluator_hash to an
+        otherwise identical SLA deterministically changes the binding.
+        Spec §A3: 'Adding ... changes integrity_binding (tested).'"""
+        plain = InterOrgSLA.create(**_base_kwargs(usd))
+
+        with_pe = InterOrgSLA.create(
+            **dict(_base_kwargs(usd), primary_evaluator_did="did:x")
+        )
+        with_ch = InterOrgSLA.create(
+            **dict(_base_kwargs(usd), canonical_evaluator_hash="b" * 64)
+        )
+        with_cw = InterOrgSLA.create(
+            **dict(_base_kwargs(usd), challenge_window_sec=7_200)
+        )
+
+        # Each variant must differ from plain and from each other.
+        bindings = {
+            plain.integrity_binding,
+            with_pe.integrity_binding,
+            with_ch.integrity_binding,
+            with_cw.integrity_binding,
+        }
+        assert len(bindings) == 4
+
+        # Deterministic: recreate with_pe with the same inputs, same binding.
+        with_pe_again = InterOrgSLA.create(
+            **dict(_base_kwargs(usd), primary_evaluator_did="did:x")
+        )
+        assert with_pe_again.integrity_binding == with_pe.integrity_binding
+
+    def test_v1a_created_sla_self_verifies(self, usd):
+        """A fresh v1a SLA (with all new-field defaults) must verify its
+        own binding so future canonical-shape changes stay caught."""
+        sla = InterOrgSLA.create(**_base_kwargs(usd))
+        assert sla.verify_binding() is True
+
+    def test_challenge_window_below_floor_raises(self, usd):
+        kwargs = _base_kwargs(usd)
+        kwargs["challenge_window_sec"] = 59
+        with pytest.raises(ValueError, match="challenge_window_sec"):
+            InterOrgSLA.create(**kwargs)
+
+    def test_challenge_window_above_ceiling_raises(self, usd):
+        kwargs = _base_kwargs(usd)
+        kwargs["challenge_window_sec"] = 604_801
+        with pytest.raises(ValueError, match="challenge_window_sec"):
+            InterOrgSLA.create(**kwargs)
+
+    def test_challenge_window_boundaries_accepted(self, usd):
+        """60s (floor) and 604_800s (7-day ceiling) must both construct."""
+        low = InterOrgSLA.create(
+            **dict(_base_kwargs(usd), challenge_window_sec=60)
+        )
+        high = InterOrgSLA.create(
+            **dict(_base_kwargs(usd), challenge_window_sec=604_800)
+        )
+        assert low.challenge_window_sec == 60
+        assert high.challenge_window_sec == 604_800
+
+    def test_challenge_window_wrong_type_raises(self, usd):
+        kwargs = _base_kwargs(usd)
+        kwargs["challenge_window_sec"] = 3600.0
+        with pytest.raises(TypeError, match="challenge_window_sec"):
+            InterOrgSLA.create(**kwargs)
+
+    def test_challenge_window_bool_rejected(self, usd):
+        """bool is an int subclass; reject explicitly so True/False don't
+        silently sneak past the range check."""
+        kwargs = _base_kwargs(usd)
+        kwargs["challenge_window_sec"] = True
+        with pytest.raises(TypeError, match="challenge_window_sec"):
+            InterOrgSLA.create(**kwargs)
+
+    def test_artifact_hash_not_string_raises(self, usd):
+        kwargs = _base_kwargs(usd)
+        kwargs["artifact_hash_at_delivery"] = None
+        with pytest.raises(TypeError, match="artifact_hash_at_delivery"):
+            InterOrgSLA.create(**kwargs)
+
+    def test_with_delivery_hash_populates_and_rebinds(self, usd):
+        sla = InterOrgSLA.create(**_base_kwargs(usd))
+        assert sla.artifact_hash_at_delivery == ""
+        original_binding = sla.integrity_binding
+
+        delivered = sla.with_delivery_hash("cafebabe" * 8)
+        assert delivered.artifact_hash_at_delivery == "cafebabe" * 8
+        assert delivered.integrity_binding != original_binding
+        assert delivered.verify_binding() is True
+
+    def test_with_delivery_hash_is_pure(self, usd):
+        """Returns a new instance; original SLA unchanged."""
+        sla = InterOrgSLA.create(**_base_kwargs(usd))
+        _ = sla.with_delivery_hash("f" * 64)
+        assert sla.artifact_hash_at_delivery == ""
+
+    def test_with_delivery_hash_rejects_empty(self, usd):
+        sla = InterOrgSLA.create(**_base_kwargs(usd))
+        with pytest.raises(ValueError, match="artifact_hash"):
+            sla.with_delivery_hash("")
+
+    def test_with_delivery_hash_rejects_non_string(self, usd):
+        sla = InterOrgSLA.create(**_base_kwargs(usd))
+        with pytest.raises(ValueError, match="artifact_hash"):
+            sla.with_delivery_hash(0xDEADBEEF)  # type: ignore[arg-type]
+
+    def test_primary_evaluator_did_empty_string_rejected(self, usd):
+        kwargs = _base_kwargs(usd)
+        kwargs["primary_evaluator_did"] = ""
+        with pytest.raises(ValueError, match="primary_evaluator_did"):
+            InterOrgSLA.create(**kwargs)
+
+    def test_canonical_evaluator_hash_empty_string_rejected(self, usd):
+        kwargs = _base_kwargs(usd)
+        kwargs["canonical_evaluator_hash"] = ""
+        with pytest.raises(ValueError, match="canonical_evaluator_hash"):
+            InterOrgSLA.create(**kwargs)
+
+    def test_from_dict_defaults_for_missing_v1a_fields(self, usd, registry):
+        """A payload that pre-dates v1a and omits the four new fields
+        still rehydrates; defaults fill in. This is what lets an old
+        serialized SLA still load under the new schema.
+        """
+        sla = InterOrgSLA.create(**_base_kwargs(usd))
+        payload = sla.to_dict()
+        for key in (
+            "artifact_hash_at_delivery",
+            "primary_evaluator_did",
+            "canonical_evaluator_hash",
+            "challenge_window_sec",
+        ):
+            payload.pop(key, None)
+        rehydrated = InterOrgSLA.from_dict(payload, registry)
+        assert rehydrated.artifact_hash_at_delivery == ""
+        assert rehydrated.primary_evaluator_did is None
+        assert rehydrated.canonical_evaluator_hash is None
+        assert rehydrated.challenge_window_sec == 86_400

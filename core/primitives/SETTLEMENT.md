@@ -116,11 +116,12 @@ What the v0 stack defends against:
   that auto-slashes a provider who vanishes between `lock` and
   delivery. Use `expires_at` + lazy evaluation — the caller must
   check expiry before settling.
-- **Deliverable-quality dispute.** v0 has no inter-node oracle for
-  whether the delivered work actually meets
-  `accuracy_requirement`. The scenario sim cheats with a ZKP stub;
-  a production system would need a quality oracle or an arbitration
-  layer above this one.
+- **Deliverable-quality dispute (v0 only).** v0 had no inter-node
+  oracle for whether the delivered work actually meets its schema.
+  The scenario sim cheated with a ZKP stub. **v1a closes this gap**:
+  see [ORACLE.md](ORACLE.md) for the Tier 0 schema verifier and the
+  Tier 3 founder override. Tier 1 (LLM evaluator with challenge
+  window) and Tier 2 (judge quorum) remain out of scope until v1b/v1c.
 
 ## (c) Keypair lifecycle
 
@@ -136,6 +137,24 @@ What the v0 stack defends against:
 The `NodeRegistry` YAML format is already forward-compat — the
 `first_seen` and `notes` fields exist precisely so v1 can record
 key-rotation history.
+
+## (c.1) Verdict lifecycle (v1a)
+
+v1a adds `release_pending_verdict(handle, verdict, ...)` to every
+`SettlementAdapter`. It refuses to act unless the verdict's signature
+verifies, the verdict's `sla_id` matches the escrow handle's ref, and
+the verdict's `artifact_hash` matches the hash the caller asserts was
+delivered. Event sequences:
+
+- **Tier 0 accepted:** `lock -> verdict_issued -> release_from_verdict`
+- **Tier 0 rejected:** `lock -> verdict_issued -> slash_from_verdict`
+- **Tier 0 refunded:** `lock -> verdict_issued -> refund_from_verdict`
+- **Tier 3 founder override:** prior Tier 0 sequence, then
+  `verdict_issued (tier=3) -> founder_override -> release_from_verdict`
+
+See [ORACLE.md](ORACLE.md) for the end-to-end walkthrough, the twelve
+binding `SchemaVerifier` rulings, the founder-override flow, and
+the third-party replay guarantee.
 
 ## (d) Audit-ledger format and replay semantics
 

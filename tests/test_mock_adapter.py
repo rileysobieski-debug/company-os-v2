@@ -1,9 +1,9 @@
 """
-tests/test_mock_adapter.py — Ticket 3 coverage
-==============================================
+tests/test_mock_adapter.py -- Ticket 3 + A5 coverage
+====================================================
 Tests for `core.primitives.settlement_adapters.mock_adapter.MockSettlementAdapter`.
 
-Covered:
+Covered (original Ticket 3):
 - supports() advertises capability correctly
 - lock freezes balance; release transfers, emits valid SettlementReceipt
 - get_status transitions locked -> released / slashed
@@ -17,21 +17,45 @@ Covered:
 - distinct nonces succeed independently
 - multi-asset support: one adapter handles USD + EUR with separate balances
 - SettlementReceipt.ts matches canonical UTC-Z form
+
+Covered (Ticket A5 -- release_pending_verdict):
+- accepted path: escrow released to provider, correct ledger sequence
+- rejected path: 100% slash to requester, correct ledger sequence
+- refunded path: escrow returned to locker, correct ledger sequence
+- double machine verdict raises VerdictError
+- founder override path: rejected Tier 0 then accepted Tier 3 releases correctly,
+  ledger sequence: lock -> verdict_issued(tier0) -> slash_from_verdict ->
+  verdict_issued(tier3) -> founder_override -> release_from_verdict
+- tampered verdict raises SignatureError
+- mismatched sla_id raises VerdictError
+- mismatched artifact_hash raises VerdictError
+- StablecoinStubAdapter.release_pending_verdict raises NotImplementedError
 """
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import re
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
 from core.primitives.asset import AssetRef
 from core.primitives.exceptions import (
     EscrowStateError,
+    SignatureError,
     UnsupportedAssetError,
+    VerdictError,
 )
+from core.primitives.identity import Ed25519Keypair
 from core.primitives.money import Money
+from core.primitives.oracle import Oracle, OracleVerdict
+from core.primitives.schema_verifier import SchemaVerifier
 from core.primitives.settlement_adapters.mock_adapter import MockSettlementAdapter
+from core.primitives.settlement_adapters.stablecoin_stub import StablecoinStubAdapter
+from core.primitives.settlement_ledger import SettlementEventLedger
+from core.primitives.sla import InterOrgSLA
 
 
 _TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
@@ -403,3 +427,492 @@ def test_ledger_kwarg_default_none_no_writes(asset_registry):
     )
     # Release and slash paths also work without a ledger.
     adapter.release(handle, to="bob")
+
+
+# ---------------------------------------------------------------------------
+# A5 helpers
+# ---------------------------------------------------------------------------
+def _valid_schema_envelope() -> dict:
+    return {
+        "kind": "json_schema",
+        "spec_version": "2020-12",
+        "schema": {
+            "type": "object",
+            "properties": {"summary": {"type": "string"}},
+            "required": ["summary"],
+        },
+    }
+
+
+def _make_sla_with_hash(artifact_bytes: bytes, *, usd: AssetRef) -> InterOrgSLA:
+    """Build a minimal SLA with delivery hash populated."""
+    payment = Money(Decimal("100.000000"), usd)
+    sla = InterOrgSLA.create(
+        sla_id="test-sla-a5-001",
+        requester_node_did="did:test:requester",
+        provider_node_did="did:test:provider",
+        task_scope="A5 adapter integration test",
+        deliverable_schema=_valid_schema_envelope(),
+        accuracy_requirement=0.9,
+        latency_ms=60_000,
+        payment=payment,
+        penalty_stake=payment,
+        nonce=InterOrgSLA.new_nonce(),
+        issued_at="2026-04-21T00:00:00Z",
+        expires_at="2026-04-28T00:00:00Z",
+    )
+    artifact_hash = hashlib.sha256(artifact_bytes).hexdigest()
+    return sla.with_delivery_hash(artifact_hash)
+
+
+def _adapter_with_locked_escrow(
+    usd: AssetRef,
+    ledger: SettlementEventLedger,
+    sla: InterOrgSLA,
+    *,
+    nonce: str = "nonce-v1",
+) -> tuple[MockSettlementAdapter, object]:
+    """Fund requester and lock escrow against sla_id. Returns (adapter, handle)."""
+    adapter = MockSettlementAdapter((usd,), ledger=ledger)
+    adapter.fund("did:test:requester", Money(Decimal("100.000000"), usd))
+    handle = adapter.lock(
+        Money(Decimal("100.000000"), usd),
+        ref=sla.sla_id,
+        nonce=nonce,
+        principal="did:test:requester",
+    )
+    return adapter, handle
+
+
+# ---------------------------------------------------------------------------
+# A5: release_pending_verdict -- three result paths
+# ---------------------------------------------------------------------------
+def test_release_pending_verdict_accepted(asset_registry, tmp_path: Path):
+    """accepted: escrow released to provider; ledger sequence lock -> verdict_issued -> release_from_verdict."""
+    usd = asset_registry.get("mock-usd")
+    ledger = SettlementEventLedger(tmp_path)
+
+    node_kp = Ed25519Keypair.generate()
+    # Artifact satisfies schema (has "summary" field) -> verdict result = accepted.
+    artifact_bytes = b'{"summary": "all good"}'
+    sla = _make_sla_with_hash(artifact_bytes, usd=usd)
+
+    oracle = Oracle(
+        node_did="did:test:oracle",
+        node_keypair=node_kp,
+        schema_verifier=SchemaVerifier(),
+    )
+    verdict = oracle.evaluate_tier0(sla, artifact_bytes)
+    assert verdict.result == "accepted"
+
+    adapter, handle = _adapter_with_locked_escrow(usd, ledger, sla)
+
+    receipt = adapter.release_pending_verdict(
+        handle,
+        verdict,
+        expected_artifact_hash=sla.artifact_hash_at_delivery,
+        requester_did="did:test:requester",
+        provider_did="did:test:provider",
+    )
+
+    assert receipt.outcome == "released"
+    assert receipt.to == "did:test:provider"
+    assert receipt.transferred == Money(Decimal("100.000000"), usd)
+
+    # Provider credited, requester unchanged (had 100 - 100 locked = 0).
+    assert adapter.balance("did:test:provider", usd) == Money(Decimal("100.000000"), usd)
+    assert adapter.get_status(handle) == "released"
+
+    events = ledger.load_all()
+    kinds = [e.kind for e in events]
+    assert kinds == ["lock", "verdict_issued", "release_from_verdict"]
+    assert events[1].metadata["result"] == "accepted"
+    assert events[1].metadata["verdict_hash"] == verdict.verdict_hash
+
+
+def test_release_pending_verdict_rejected(asset_registry, tmp_path: Path):
+    """rejected: 100% slash to requester; ledger sequence lock -> verdict_issued -> slash_from_verdict."""
+    usd = asset_registry.get("mock-usd")
+    ledger = SettlementEventLedger(tmp_path)
+
+    node_kp = Ed25519Keypair.generate()
+    # Artifact missing required "summary" field -> rejected verdict from schema verifier.
+    artifact_bytes = b'{"missing_summary": true}'
+    sla = _make_sla_with_hash(artifact_bytes, usd=usd)
+    artifact_hash = hashlib.sha256(artifact_bytes).hexdigest()
+
+    verdict = OracleVerdict.create(
+        sla_id=sla.sla_id,
+        artifact_hash=artifact_hash,
+        tier=0,
+        result="rejected",
+        evaluator_did="did:test:oracle-node",
+        evidence={"kind": "schema_fail", "error": "failed validation"},
+        issued_at="2026-04-21T00:00:00Z",
+        keypair=node_kp,
+    )
+
+    adapter, handle = _adapter_with_locked_escrow(usd, ledger, sla)
+    receipt = adapter.release_pending_verdict(
+        handle,
+        verdict,
+        expected_artifact_hash=sla.artifact_hash_at_delivery,
+        requester_did="did:test:requester",
+        provider_did="did:test:provider",
+    )
+
+    assert receipt.outcome == "slashed"
+    assert receipt.to == "did:test:requester"
+    assert receipt.transferred == Money(Decimal("100.000000"), usd)
+
+    # Requester gets back the slashed amount (100% slash to requester = transfer back).
+    assert adapter.balance("did:test:requester", usd) == Money(Decimal("100.000000"), usd)
+    assert adapter.balance("did:test:provider", usd) == Money.zero(usd)
+    assert adapter.get_status(handle) == "slashed"
+
+    events = ledger.load_all()
+    kinds = [e.kind for e in events]
+    assert kinds == ["lock", "verdict_issued", "slash_from_verdict"]
+    assert events[1].metadata["result"] == "rejected"
+
+
+def test_release_pending_verdict_refunded(asset_registry, tmp_path: Path):
+    """refunded: escrow returned to locker, no slash; ledger sequence lock -> verdict_issued -> refund_from_verdict."""
+    usd = asset_registry.get("mock-usd")
+    ledger = SettlementEventLedger(tmp_path)
+
+    node_kp = Ed25519Keypair.generate()
+    artifact_bytes = b'{"parse_error": true}'
+    sla = _make_sla_with_hash(artifact_bytes, usd=usd)
+    artifact_hash = hashlib.sha256(artifact_bytes).hexdigest()
+
+    verdict = OracleVerdict.create(
+        sla_id=sla.sla_id,
+        artifact_hash=artifact_hash,
+        tier=0,
+        result="refunded",
+        evaluator_did="did:test:oracle-node",
+        evidence={"kind": "artifact_parse_error", "error": "could not decode"},
+        issued_at="2026-04-21T00:00:00Z",
+        keypair=node_kp,
+    )
+
+    adapter, handle = _adapter_with_locked_escrow(usd, ledger, sla)
+    receipt = adapter.release_pending_verdict(
+        handle,
+        verdict,
+        expected_artifact_hash=sla.artifact_hash_at_delivery,
+        requester_did="did:test:requester",
+        provider_did="did:test:provider",
+    )
+
+    assert receipt.outcome == "released"
+    assert receipt.to == "did:test:requester"
+    assert receipt.transferred == Money(Decimal("100.000000"), usd)
+
+    assert adapter.balance("did:test:requester", usd) == Money(Decimal("100.000000"), usd)
+    assert adapter.balance("did:test:provider", usd) == Money.zero(usd)
+    assert adapter.get_status(handle) == "released"
+
+    events = ledger.load_all()
+    kinds = [e.kind for e in events]
+    assert kinds == ["lock", "verdict_issued", "refund_from_verdict"]
+    assert events[1].metadata["result"] == "refunded"
+
+
+# ---------------------------------------------------------------------------
+# A5: double-verdict rejected
+# ---------------------------------------------------------------------------
+def test_double_machine_verdict_rejected(asset_registry, tmp_path: Path):
+    """A second machine verdict (non-Tier-3) on the same SLA raises VerdictError."""
+    usd = asset_registry.get("mock-usd")
+    ledger = SettlementEventLedger(tmp_path)
+
+    node_kp = Ed25519Keypair.generate()
+    artifact_bytes = b'{"double_verdict": true}'
+    sla = _make_sla_with_hash(artifact_bytes, usd=usd)
+    artifact_hash = hashlib.sha256(artifact_bytes).hexdigest()
+
+    verdict1 = OracleVerdict.create(
+        sla_id=sla.sla_id,
+        artifact_hash=artifact_hash,
+        tier=0,
+        result="rejected",
+        evaluator_did="did:test:oracle",
+        evidence={"kind": "schema_fail", "error": "oops"},
+        issued_at="2026-04-21T00:00:00Z",
+        keypair=node_kp,
+    )
+    verdict2 = OracleVerdict.create(
+        sla_id=sla.sla_id,
+        artifact_hash=artifact_hash,
+        tier=0,
+        result="accepted",
+        evaluator_did="did:test:oracle",
+        evidence={"kind": "schema_pass", "detail": "ok"},
+        issued_at="2026-04-21T00:01:00Z",
+        keypair=node_kp,
+    )
+
+    adapter = MockSettlementAdapter((usd,), ledger=ledger)
+    adapter.fund("did:test:requester", Money(Decimal("100.000000"), usd))
+    handle = adapter.lock(
+        Money(Decimal("100.000000"), usd),
+        ref=sla.sla_id,
+        nonce="nonce-dbl",
+        principal="did:test:requester",
+    )
+
+    adapter.release_pending_verdict(
+        handle,
+        verdict1,
+        expected_artifact_hash=artifact_hash,
+        requester_did="did:test:requester",
+        provider_did="did:test:provider",
+    )
+
+    # Fund a new escrow for the second attempt (first is already finalized).
+    adapter.fund("did:test:requester", Money(Decimal("100.000000"), usd))
+    handle2 = adapter.lock(
+        Money(Decimal("100.000000"), usd),
+        ref=sla.sla_id,
+        nonce="nonce-dbl2",
+        principal="did:test:requester",
+    )
+
+    with pytest.raises(VerdictError, match="verdict already issued"):
+        adapter.release_pending_verdict(
+            handle2,
+            verdict2,
+            expected_artifact_hash=artifact_hash,
+            requester_did="did:test:requester",
+            provider_did="did:test:provider",
+        )
+
+
+# ---------------------------------------------------------------------------
+# A5: founder override path
+# ---------------------------------------------------------------------------
+def test_founder_override_path_full_sequence(asset_registry, tmp_path: Path):
+    """Tier 0 rejected, then Tier 3 founder override accepted.
+
+    Ledger sequence: lock -> verdict_issued(tier0) -> slash_from_verdict
+                     -> lock -> verdict_issued(tier3) -> founder_override -> release_from_verdict
+    """
+    from core.primitives.state import FOUNDER_PRINCIPALS
+    usd = asset_registry.get("mock-usd")
+    ledger = SettlementEventLedger(tmp_path)
+
+    node_kp = Ed25519Keypair.generate()
+    founder_kp = Ed25519Keypair.generate()
+    founder_identity = next(iter(FOUNDER_PRINCIPALS))
+
+    artifact_bytes = b'{"override_test": true}'
+    sla = _make_sla_with_hash(artifact_bytes, usd=usd)
+    artifact_hash = hashlib.sha256(artifact_bytes).hexdigest()
+
+    oracle = Oracle(
+        node_did="did:test:oracle",
+        node_keypair=node_kp,
+        schema_verifier=SchemaVerifier(),
+    )
+
+    tier0_verdict = OracleVerdict.create(
+        sla_id=sla.sla_id,
+        artifact_hash=artifact_hash,
+        tier=0,
+        result="rejected",
+        evaluator_did="did:test:oracle",
+        evidence={"kind": "schema_fail", "error": "bad"},
+        issued_at="2026-04-21T00:00:00Z",
+        keypair=node_kp,
+    )
+
+    # Lock escrow and run tier0 rejection.
+    adapter = MockSettlementAdapter((usd,), ledger=ledger)
+    adapter.fund("did:test:requester", Money(Decimal("100.000000"), usd))
+    handle1 = adapter.lock(
+        Money(Decimal("100.000000"), usd),
+        ref=sla.sla_id,
+        nonce="nonce-fo1",
+        principal="did:test:requester",
+    )
+
+    adapter.release_pending_verdict(
+        handle1,
+        tier0_verdict,
+        expected_artifact_hash=artifact_hash,
+        requester_did="did:test:requester",
+        provider_did="did:test:provider",
+    )
+
+    # Now do the founder override on a new escrow lock.
+    tier3_verdict = oracle.founder_override(
+        prior_verdict=tier0_verdict,
+        result="accepted",
+        reason="requester error confirmed by founder review",
+        founder_keypair=founder_kp,
+        founder_identity=founder_identity,
+    )
+
+    adapter.fund("did:test:requester", Money(Decimal("100.000000"), usd))
+    handle2 = adapter.lock(
+        Money(Decimal("100.000000"), usd),
+        ref=sla.sla_id,
+        nonce="nonce-fo2",
+        principal="did:test:requester",
+    )
+
+    receipt = adapter.release_pending_verdict(
+        handle2,
+        tier3_verdict,
+        expected_artifact_hash=artifact_hash,
+        requester_did="did:test:requester",
+        provider_did="did:test:provider",
+    )
+
+    assert receipt.outcome == "released"
+    assert receipt.to == "did:test:provider"
+
+    events = ledger.load_all()
+    kinds = [e.kind for e in events]
+    assert kinds == [
+        "lock",
+        "verdict_issued",       # tier0 rejection
+        "slash_from_verdict",
+        "lock",
+        "verdict_issued",       # tier3 override
+        "founder_override",
+        "release_from_verdict",
+    ], f"unexpected event sequence: {kinds}"
+
+    # tier3 verdict_issued carries overrides metadata.
+    tier3_vi = events[4]
+    assert tier3_vi.metadata["tier"] == 3
+    assert tier3_vi.metadata["overrides"] == tier0_verdict.verdict_hash
+
+    # founder_override event carries identity and reason.
+    fo_event = events[5]
+    assert fo_event.kind == "founder_override"
+    assert fo_event.metadata["founder_identity"] == founder_identity
+    assert fo_event.metadata["reason"] != ""
+
+
+# ---------------------------------------------------------------------------
+# A5: error cases
+# ---------------------------------------------------------------------------
+def test_tampered_verdict_raises_signature_error(asset_registry, tmp_path: Path):
+    """Mutating a verdict field after signing raises SignatureError."""
+    usd = asset_registry.get("mock-usd")
+    ledger = SettlementEventLedger(tmp_path)
+
+    node_kp = Ed25519Keypair.generate()
+    artifact_bytes = b'{"tamper_test": true}'
+    sla = _make_sla_with_hash(artifact_bytes, usd=usd)
+    artifact_hash = hashlib.sha256(artifact_bytes).hexdigest()
+
+    verdict = OracleVerdict.create(
+        sla_id=sla.sla_id,
+        artifact_hash=artifact_hash,
+        tier=0,
+        result="accepted",
+        evaluator_did="did:test:oracle",
+        evidence={"kind": "schema_pass"},
+        issued_at="2026-04-21T00:00:00Z",
+        keypair=node_kp,
+    )
+    # Tamper: swap result field -- OracleVerdict is frozen, so use dataclasses.replace.
+    tampered = dataclasses.replace(verdict, result="rejected")
+
+    adapter, handle = _adapter_with_locked_escrow(usd, ledger, sla)
+
+    with pytest.raises(SignatureError):
+        adapter.release_pending_verdict(
+            handle,
+            tampered,
+            expected_artifact_hash=artifact_hash,
+            requester_did="did:test:requester",
+            provider_did="did:test:provider",
+        )
+
+
+def test_mismatched_sla_id_raises_verdict_error(asset_registry, tmp_path: Path):
+    """Verdict with wrong sla_id raises VerdictError before any other check."""
+    usd = asset_registry.get("mock-usd")
+    ledger = SettlementEventLedger(tmp_path)
+
+    node_kp = Ed25519Keypair.generate()
+    artifact_bytes = b'{"sla_mismatch": true}'
+    sla = _make_sla_with_hash(artifact_bytes, usd=usd)
+    artifact_hash = hashlib.sha256(artifact_bytes).hexdigest()
+
+    verdict = OracleVerdict.create(
+        sla_id="wrong-sla-id",
+        artifact_hash=artifact_hash,
+        tier=0,
+        result="accepted",
+        evaluator_did="did:test:oracle",
+        evidence={"kind": "schema_pass"},
+        issued_at="2026-04-21T00:00:00Z",
+        keypair=node_kp,
+    )
+
+    adapter, handle = _adapter_with_locked_escrow(usd, ledger, sla)
+
+    with pytest.raises(VerdictError, match="sla_id"):
+        adapter.release_pending_verdict(
+            handle,
+            verdict,
+            expected_artifact_hash=artifact_hash,
+            requester_did="did:test:requester",
+            provider_did="did:test:provider",
+        )
+
+
+def test_mismatched_artifact_hash_raises_verdict_error(asset_registry, tmp_path: Path):
+    """Verdict artifact_hash != expected_artifact_hash raises VerdictError."""
+    usd = asset_registry.get("mock-usd")
+    ledger = SettlementEventLedger(tmp_path)
+
+    node_kp = Ed25519Keypair.generate()
+    artifact_bytes = b'{"hash_mismatch": true}'
+    sla = _make_sla_with_hash(artifact_bytes, usd=usd)
+    artifact_hash = hashlib.sha256(artifact_bytes).hexdigest()
+    wrong_hash = "b" * 64
+
+    verdict = OracleVerdict.create(
+        sla_id=sla.sla_id,
+        artifact_hash=wrong_hash,
+        tier=0,
+        result="accepted",
+        evaluator_did="did:test:oracle",
+        evidence={"kind": "schema_pass"},
+        issued_at="2026-04-21T00:00:00Z",
+        keypair=node_kp,
+    )
+
+    adapter, handle = _adapter_with_locked_escrow(usd, ledger, sla)
+
+    with pytest.raises(VerdictError, match="artifact hash mismatch"):
+        adapter.release_pending_verdict(
+            handle,
+            verdict,
+            expected_artifact_hash=artifact_hash,
+            requester_did="did:test:requester",
+            provider_did="did:test:provider",
+        )
+
+
+def test_stablecoin_stub_release_pending_verdict_raises(asset_registry):
+    """StablecoinStubAdapter.release_pending_verdict raises NotImplementedError."""
+    usd = asset_registry.get("mock-usd")
+    stub = StablecoinStubAdapter((usd,), rpc_url="http://localhost", sender_address="0x0")
+
+    with pytest.raises(NotImplementedError, match="stablecoin stub"):
+        stub.release_pending_verdict(
+            None,  # type: ignore[arg-type]
+            None,  # type: ignore[arg-type]
+            expected_artifact_hash="x",
+            requester_did="r",
+            provider_did="p",
+        )

@@ -60,3 +60,6 @@ lab-notebook.md
 
 # Worktrees
 .worktrees/
+
+# Review bundle is a working artifact, not tracked
+review-bundle/

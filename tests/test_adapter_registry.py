@@ -66,6 +66,11 @@ class _SingleAssetStub:
     def get_status(self, handle):  # pragma: no cover
         raise NotImplementedError
 
+    def release_pending_verdict(  # pragma: no cover
+        self, handle, verdict, *, expected_artifact_hash, requester_did, provider_did
+    ):
+        raise NotImplementedError
+
 
 class _MultiAssetStub:
     """Adapter stub that supports several asset_ids — multi-asset case."""
@@ -89,6 +94,11 @@ class _MultiAssetStub:
         raise NotImplementedError
 
     def get_status(self, handle):  # pragma: no cover
+        raise NotImplementedError
+
+    def release_pending_verdict(  # pragma: no cover
+        self, handle, verdict, *, expected_artifact_hash, requester_did, provider_did
+    ):
         raise NotImplementedError
 
 

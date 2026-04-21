@@ -5,3 +5,4 @@ flask>=3.0
 markdown-it-py>=3.0
 hypothesis>=6.0
 pynacl>=1.5
+jsonschema>=4.0
