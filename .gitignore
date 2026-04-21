@@ -57,3 +57,6 @@ eval-responses/
 
 # Private working notebook (not for public repo)
 lab-notebook.md
+
+# Worktrees
+.worktrees/
