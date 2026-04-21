@@ -49,6 +49,7 @@ Full round-trip. `from_dict` rejects unknown `evidence.kind` with
 """
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 from dataclasses import dataclass
@@ -63,7 +64,11 @@ from core.primitives.canonicalizer_registry import (
     default_canonicalizer_registry,
     extract_protocol_version,
 )
-from core.primitives.exceptions import SignatureError, VerdictError
+from core.primitives.exceptions import (
+    EvaluatorAuthorizationError,
+    SignatureError,
+    VerdictError,
+)
 from core.primitives.identity import (
     Ed25519Keypair,
     Ed25519PublicKey,
@@ -603,6 +608,7 @@ class Oracle:
         node_did: str,
         node_keypair: Ed25519Keypair,
         schema_verifier: "SchemaVerifier",
+        evaluator_timeout_sec: int = 30,
     ) -> None:
         if not isinstance(node_did, str) or not node_did.strip():
             raise ValueError("node_did must be a non-empty string")
@@ -611,9 +617,12 @@ class Oracle:
                 f"node_keypair must be an Ed25519Keypair, "
                 f"got {type(node_keypair).__name__}"
             )
+        if not isinstance(evaluator_timeout_sec, int) or evaluator_timeout_sec <= 0:
+            raise ValueError("evaluator_timeout_sec must be a positive int")
         self.node_did = node_did
         self.node_keypair = node_keypair
         self.schema_verifier = schema_verifier
+        self.evaluator_timeout_sec = evaluator_timeout_sec
 
     def evaluate_tier0(
         self,
@@ -737,5 +746,218 @@ class Oracle:
             evidence=evidence,
             issued_at=issued_at,
             signer=founder_signer,
+        )
+
+    def evaluate_tier1(
+        self,
+        sla: "InterOrgSLA",
+        artifact_bytes: bytes,
+        *,
+        evaluator: "PrimaryEvaluator",
+        artifact_properties: dict | None = None,
+    ) -> OracleVerdict:
+        """Run Tier 1 (probabilistic) evaluation and return a signed verdict.
+
+        Authorization checks (run before calling the evaluator):
+          1. Canonical hash check: if `sla.canonical_evaluator_hash` is set,
+             it MUST equal `evaluator.canonical_hash`; else raises
+             `EvaluatorAuthorizationError`.
+          2. Counterparty check: `evaluator.evaluator_did` must not equal
+             `sla.requester_node_did` or `sla.provider_node_did`; else raises
+             `EvaluatorAuthorizationError`.
+
+        Mechanical gate: delegates to `SchemaVerifier.verify`. If the schema
+        result is not "accepted", returns a Tier 0 verdict immediately (the
+        evaluator is NOT called). The returned verdict's evidence carries
+        `tier1_skipped_via_mechanical_fail: true`.
+
+        Evaluator call: wrapped in a thread-based wall-clock timeout
+        (`self.evaluator_timeout_sec`). On timeout, returns a refunded verdict
+        with `evidence.kind = "evaluator_timeout"`.
+
+        Parameters
+        ----------
+        sla:
+            The InterOrgSLA governing this delivery.
+        artifact_bytes:
+            Raw bytes of the delivered artifact.
+        evaluator:
+            A `PrimaryEvaluator` instance to call after the mechanical gate.
+        artifact_properties:
+            Optional dict for binary artifacts. Passed to both the schema
+            verifier and the evaluator unchanged.
+
+        Returns
+        -------
+        OracleVerdict
+            A signed Tier 1 verdict. `evaluator_did` is set to
+            `evaluator.evaluator_did`.
+
+        Raises
+        ------
+        EvaluatorAuthorizationError
+            If the canonical hash check or counterparty check fails.
+        """
+        # Lazy import to avoid circular at module load time.
+        from core.primitives.evaluator import PrimaryEvaluator  # noqa: PLC0415
+
+        # ------------------------------------------------------------------
+        # Authorization checks (before touching the artifact or schema)
+        # ------------------------------------------------------------------
+        canonical_hash_required = sla.canonical_evaluator_hash
+        if canonical_hash_required:
+            if evaluator.canonical_hash != canonical_hash_required:
+                raise EvaluatorAuthorizationError(
+                    f"evaluator canonical_hash {evaluator.canonical_hash!r} "
+                    f"does not match SLA canonical_evaluator_hash "
+                    f"{canonical_hash_required!r}"
+                )
+
+        if evaluator.evaluator_did == sla.requester_node_did:
+            raise EvaluatorAuthorizationError(
+                f"evaluator_did {evaluator.evaluator_did!r} must not equal "
+                f"requester_node_did {sla.requester_node_did!r}"
+            )
+        if evaluator.evaluator_did == sla.provider_node_did:
+            raise EvaluatorAuthorizationError(
+                f"evaluator_did {evaluator.evaluator_did!r} must not equal "
+                f"provider_node_did {sla.provider_node_did!r}"
+            )
+
+        # ------------------------------------------------------------------
+        # Mechanical gate: Tier 0 schema check
+        # ------------------------------------------------------------------
+        artifact_hash = hashlib.sha256(artifact_bytes).hexdigest()
+        issued_at = _datetime_now_utc_z()
+
+        schema_result, schema_evidence = self.schema_verifier.verify(
+            sla, artifact_bytes, artifact_properties=artifact_properties
+        )
+
+        if schema_result != "accepted":
+            # Mechanical fail: return a Tier 0 verdict; evaluator not called.
+            tier0_evidence = dict(schema_evidence)
+            tier0_evidence["tier1_skipped_via_mechanical_fail"] = True
+            return OracleVerdict.create(
+                sla_id=sla.sla_id,
+                artifact_hash=artifact_hash,
+                tier=0,
+                result=schema_result,
+                evaluator_did=self.node_did,
+                evidence=tier0_evidence,
+                issued_at=issued_at,
+                signer=LocalKeypairSigner(self.node_keypair),
+            )
+
+        # ------------------------------------------------------------------
+        # Evaluator call with wall-clock timeout
+        # ------------------------------------------------------------------
+        node_signer = LocalKeypairSigner(self.node_keypair)
+
+        def _call_evaluator():
+            return evaluator.evaluate(
+                sla, artifact_bytes, artifact_properties=artifact_properties
+            )
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(_call_evaluator)
+                output = future.result(timeout=self.evaluator_timeout_sec)
+        except concurrent.futures.TimeoutError:
+            timeout_evidence = {
+                "kind": "evaluator_timeout",
+                "detail": f"evaluator exceeded {self.evaluator_timeout_sec}s",
+            }
+            return OracleVerdict.create(
+                sla_id=sla.sla_id,
+                artifact_hash=artifact_hash,
+                tier=1,
+                result="refunded",
+                evaluator_did=evaluator.evaluator_did,
+                evidence=timeout_evidence,
+                issued_at=issued_at,
+                signer=node_signer,
+                protocol_version="companyos-verdict/0.2",
+                score=Decimal("0"),
+            )
+
+        # ------------------------------------------------------------------
+        # Build Tier 1 verdict from evaluator output
+        # ------------------------------------------------------------------
+        tier1_evidence = {
+            "kind": output.evidence["kind"],
+            "evaluator_canonical_hash": output.evaluator_canonical_hash,
+        }
+        # Carry through any additional keys the evaluator included
+        # (e.g. evaluator_error detail for refunded outputs).
+        for key, value in output.evidence.items():
+            if key != "kind":
+                tier1_evidence[key] = value
+
+        return OracleVerdict.create(
+            sla_id=sla.sla_id,
+            artifact_hash=artifact_hash,
+            tier=1,
+            result=output.result,
+            evaluator_did=evaluator.evaluator_did,
+            evidence=tier1_evidence,
+            issued_at=issued_at,
+            signer=node_signer,
+            protocol_version="companyos-verdict/0.2",
+            score=output.score,
+        )
+
+    def evaluate(
+        self,
+        sla: "InterOrgSLA",
+        artifact_bytes: bytes,
+        *,
+        evaluator: "PrimaryEvaluator | None" = None,
+        artifact_properties: dict | None = None,
+    ) -> OracleVerdict:
+        """Convenience dispatcher: routes to Tier 1 or Tier 0 based on SLA.
+
+        If `sla.primary_evaluator_did` is set (non-empty string), calls
+        `evaluate_tier1` with the supplied `evaluator`. If it is None or
+        empty, calls `evaluate_tier0`.
+
+        Parameters
+        ----------
+        sla:
+            The InterOrgSLA governing this delivery.
+        artifact_bytes:
+            Raw bytes of the delivered artifact.
+        evaluator:
+            Required when `sla.primary_evaluator_did` is set. Ignored
+            (and may be None) when routing to Tier 0.
+        artifact_properties:
+            Optional dict passed through to the chosen tier unchanged.
+
+        Returns
+        -------
+        OracleVerdict
+
+        Raises
+        ------
+        ValueError
+            If Tier 1 is selected but `evaluator` is None.
+        EvaluatorAuthorizationError
+            Propagated from `evaluate_tier1` on authorization failures.
+        """
+        if sla.primary_evaluator_did:
+            if evaluator is None:
+                raise ValueError(
+                    "evaluator is required when sla.primary_evaluator_did is set"
+                )
+            return self.evaluate_tier1(
+                sla,
+                artifact_bytes,
+                evaluator=evaluator,
+                artifact_properties=artifact_properties,
+            )
+        return self.evaluate_tier0(
+            sla,
+            artifact_bytes,
+            artifact_properties=artifact_properties,
         )
 

@@ -113,6 +113,23 @@ class ChallengeError(SettlementError):
     """
 
 
+class EvaluatorAuthorizationError(SettlementError):
+    """An evaluator failed one or more authorization checks before scoring.
+
+    Raised by `Oracle.evaluate_tier1` when:
+      - The evaluator's `canonical_hash` does not match the
+        `canonical_evaluator_hash` pinned in the SLA.
+      - The evaluator's `evaluator_did` equals the SLA's
+        `requester_node_did` or `provider_node_did` (counterparty
+        conflict: a party to the contract cannot also be its evaluator).
+
+    Distinct from `SignatureError` (which covers bad cryptography) and
+    `VerdictError` (which covers structural verdict failures). Callers
+    that want to distinguish a hash mismatch from a counterparty conflict
+    should inspect the message; the exception type covers both.
+    """
+
+
 __all__ = [
     "SettlementError",
     "AssetMismatchError",
@@ -123,4 +140,5 @@ __all__ = [
     "SignatureError",
     "VerdictError",
     "ChallengeError",
+    "EvaluatorAuthorizationError",
 ]
