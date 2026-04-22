@@ -297,6 +297,59 @@ a verdict, and the founder has not issued a Tier 3 override, the
 verdict's signature proves exactly what the issuer committed to at
 the time of issuance.
 
+## (c.2) Tier 1 evaluator flow
+
+The SLA commits to a primary evaluator via `primary_evaluator_did`, `canonical_evaluator_hash`, and `primary_evaluator_pubkey_hex`. All three must be set together or all left empty.
+
+When `Oracle.evaluate_tier1` is called:
+
+1. **Authorization checks** (before the artifact is touched):
+   - If `sla.canonical_evaluator_hash` is set, it must equal `evaluator.canonical_hash`. A mismatch raises `EvaluatorAuthorizationError` before any scoring occurs.
+   - `evaluator.evaluator_did` must not equal `sla.requester_node_did` or `sla.provider_node_did`. Counterparties cannot be their own evaluator.
+
+2. **Mechanical gate**: `SchemaVerifier.verify` runs first. If the schema result is not `"accepted"`, the evaluator is never called. A Tier 0 verdict is returned immediately with `evidence.tier1_skipped_via_mechanical_fail = True`.
+
+3. **Evaluator call**: the named evaluator's `evaluate(sla, artifact_bytes)` method runs. It is wrapped in a wall-clock timeout (`Oracle.evaluator_timeout_sec`, default 30s). On timeout, a `refunded` verdict is returned with `evidence.kind = "evaluator_timeout"`.
+
+4. **Verdict construction**: the evaluator returns an `EvaluationOutput`. Oracle wraps it into an `OracleVerdict` with `tier=1`, `protocol_version="companyos-verdict/0.2"`, and `score` populated.
+
+5. **Challenge window opens**: the verdict's `issued_at` timestamp starts the clock. Either counterparty may call `adapter.raise_challenge(...)` within `sla.challenge_window_sec` seconds. The escrow is not released until the window elapses with no unresolved challenge.
+
+The `Oracle.evaluate` dispatcher selects Tier 1 automatically when `sla.primary_evaluator_did` is set. Callers must pass an `evaluator` kwarg; omitting it raises `ValueError`.
+
+## (c.3) Challenge lifecycle
+
+Either counterparty (requester or provider) may dispute a Tier 1 verdict within the `challenge_window_sec` window by calling `adapter.raise_challenge(handle, challenge, ...)`. A `Challenge` is a signed primitive (`companyos-challenge/0.1`) that names the prior verdict via `prior_verdict_hash` and includes a `reason`.
+
+Lifecycle:
+
+1. `adapter.raise_challenge(...)` validates the `Challenge` signature, checks the challenger is a counterparty, and enforces the window deadline (Ruling 16). On success it emits a `challenge_raised` ledger event.
+2. An unresolved challenge blocks `release_pending_verdict`. The adapter scans ledger events for `challenge_raised` events whose `challenge_hash` has no matching `challenge_resolved` event.
+3. In v1b, challenges escalate to the founder. The founder calls `Oracle.founder_override(prior_verdict=tier1_verdict, result=..., ...)` to issue a Tier 3 verdict. The override evidence must include `challenge_hash` so the adapter emits `challenge_resolved` before the settlement event.
+4. The Tier 3 verdict is passed to `adapter.release_pending_verdict` as `override_verdict` (via the sim's `handle_settling`). The adapter emits `verdict_issued (tier=3)` -> `founder_override` -> `challenge_resolved` -> settlement.
+
+Ledger event sequence for the challenge path:
+```
+lock -> verdict_issued(tier=1) -> challenge_raised ->
+    verdict_issued(tier=3) -> founder_override -> challenge_resolved ->
+    release_from_verdict | slash_from_verdict | refund_from_verdict
+```
+
+## (c.4) Evaluator canonical hash semantics
+
+`canonical_evaluator_hash` is a content-addressed fingerprint of the evaluator's deployed code + prompt + model snapshot. When the SLA sets this field, it commits BOTH counterparties to a specific evaluator version for the lifetime of the SLA.
+
+The adapter enforces this at settlement time: if `expected_evaluator_canonical_hash` is passed to `release_pending_verdict`, it must match `verdict.evidence["evaluator_canonical_hash"]`. A mismatch raises `EvaluatorAuthorizationError("evaluator canonical hash drift")` and blocks settlement.
+
+What goes into the hash (for `LLMRubricEvaluator`):
+- `class`: the evaluator class name (stable across processes).
+- `version`: a manually bumped string when logic changes.
+- `model`: the LLM model identifier (e.g. `"claude-sonnet-4-6"`).
+- `rubric_hash`: SHA-256 of the rubric text.
+- `floor`: the `accuracy_requirement` floor score.
+
+The combined hash is `sha256(f"{class}:{version}:{model}:{rubric_hash}:{floor}")`. Any change to any of these inputs produces a different `canonical_hash`, causing settlements against the old SLA to be rejected by the adapter's hash check. Counterparties must re-sign a new SLA to accept a different evaluator version.
+
 ## (e) What v1a does NOT do
 
 Deliberate v1a non-goals, documented so callers do not plan

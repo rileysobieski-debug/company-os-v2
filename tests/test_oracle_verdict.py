@@ -459,12 +459,22 @@ class TestProtocolVersion:
         verdict with protocol_version="companyos-verdict/0.2" work correctly.
         The passthrough uses the same rules as 0.1 -- these tests only care
         that the version string is stored and that it participates in the hash,
-        not that the bytes differ."""
+        not that the bytes differ.
+
+        Save/restore pattern: oracle.py registers the real v0.2 canonicalizer
+        at module-load time. This fixture must restore it after each test so
+        downstream tests that depend on the real v0.2 registration continue to
+        work (e.g. Oracle.evaluate_tier1 which issues companyos-verdict/0.2).
+        """
+        prior = default_canonicalizer_registry._registry.get("companyos-verdict/0.2")
         default_canonicalizer_registry.register(
             "companyos-verdict/0.2", _canonical_bytes
         )
         yield
-        default_canonicalizer_registry._registry.pop("companyos-verdict/0.2", None)
+        if prior is not None:
+            default_canonicalizer_registry._registry["companyos-verdict/0.2"] = prior
+        else:
+            default_canonicalizer_registry._registry.pop("companyos-verdict/0.2", None)
 
     def test_default_protocol_version_populated(self, keypair):
         v = OracleVerdict.create(**_base_kwargs(keypair))
