@@ -67,7 +67,15 @@ class _SingleAssetStub:
         raise NotImplementedError
 
     def release_pending_verdict(  # pragma: no cover
-        self, handle, verdict, *, expected_artifact_hash, requester_did, provider_did
+        self, handle, verdict, *, expected_artifact_hash, requester_did, provider_did,
+        now=None, challenge_window_sec=None,
+        expected_primary_evaluator_did=None, expected_evaluator_canonical_hash=None,
+    ):
+        raise NotImplementedError
+
+    def raise_challenge(  # pragma: no cover
+        self, handle, challenge, *, requester_did, provider_did,
+        prior_verdict, challenge_window_sec,
     ):
         raise NotImplementedError
 
@@ -97,7 +105,15 @@ class _MultiAssetStub:
         raise NotImplementedError
 
     def release_pending_verdict(  # pragma: no cover
-        self, handle, verdict, *, expected_artifact_hash, requester_did, provider_did
+        self, handle, verdict, *, expected_artifact_hash, requester_did, provider_did,
+        now=None, challenge_window_sec=None,
+        expected_primary_evaluator_did=None, expected_evaluator_canonical_hash=None,
+    ):
+        raise NotImplementedError
+
+    def raise_challenge(  # pragma: no cover
+        self, handle, challenge, *, requester_did, provider_did,
+        prior_verdict, challenge_window_sec,
     ):
         raise NotImplementedError
 

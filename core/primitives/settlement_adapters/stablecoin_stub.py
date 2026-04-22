@@ -110,10 +110,26 @@ class StablecoinStubAdapter:
         expected_artifact_hash: str,
         requester_did: str,
         provider_did: str,
+        now: Any = None,
+        challenge_window_sec: Any = None,
+        expected_primary_evaluator_did: Any = None,
+        expected_evaluator_canonical_hash: Any = None,
     ) -> SettlementReceipt:
         raise NotImplementedError(
             "release_pending_verdict not implemented on stablecoin stub"
         )
+
+    def raise_challenge(
+        self,
+        handle: EscrowHandle,
+        challenge: Any,
+        *,
+        requester_did: str,
+        provider_did: str,
+        prior_verdict: Any,
+        challenge_window_sec: int,
+    ) -> None:
+        raise NotImplementedError(_NOT_IMPL_MSG)
 
 
 __all__ = ["StablecoinStubAdapter"]

@@ -73,6 +73,8 @@ EventKind = Literal[
     "slash_from_verdict",
     "refund_from_verdict",
     "founder_override",
+    "challenge_raised",
+    "challenge_resolved",
 ]
 
 

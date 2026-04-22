@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal, NewType, Protocol, runtime_checkable
 
 if TYPE_CHECKING:  # pragma: no cover — type-check only
@@ -225,6 +226,10 @@ class SettlementAdapter(Protocol):
         expected_artifact_hash: str,
         requester_did: str,
         provider_did: str,
+        now: "datetime | None" = None,
+        challenge_window_sec: "int | None" = None,
+        expected_primary_evaluator_did: "str | None" = None,
+        expected_evaluator_canonical_hash: "str | None" = None,
     ) -> SettlementReceipt:
         """Settle an escrow based on a signed `OracleVerdict`.
 
@@ -235,6 +240,11 @@ class SettlementAdapter(Protocol):
         - `verdict.artifact_hash == expected_artifact_hash` (hash binding raises
           VerdictError on mismatch).
 
+        For Tier 1 verdicts with `challenge_window_sec` set:
+        - Validates evaluator DID and canonical hash if expected values provided.
+        - Enforces the challenge window: raises ChallengeWindowError if window
+          is still open or an unresolved challenge exists.
+
         Result dispatch:
         - `accepted`  -> release escrow to `provider_did`.
         - `rejected`  -> 100% slash to `requester_did` as beneficiary.
@@ -242,12 +252,42 @@ class SettlementAdapter(Protocol):
 
         Emits a `verdict_issued` ledger event before the settlement event.
         For Tier 3 `founder_override` verdicts also emits `founder_override`.
+        For Tier 3 verdicts superseding a challenge, emits `challenge_resolved`
+        before the settlement event sequence.
 
         Raises:
             VerdictError: sla_id mismatch, artifact_hash mismatch, or
                 double-verdict without a valid Tier 3 override.
             SignatureError: cryptographic verification failure.
             EscrowStateError: escrow not in `locked` state.
+            EvaluatorAuthorizationError: evaluator DID or canonical hash mismatch.
+            ChallengeWindowError: challenge window still open or unresolved
+                challenge blocks release.
+        """
+        ...
+
+    def raise_challenge(
+        self,
+        handle: EscrowHandle,
+        challenge: "Any",
+        *,
+        requester_did: str,
+        provider_did: str,
+        prior_verdict: "OracleVerdict",
+        challenge_window_sec: int,
+    ) -> None:
+        """Record a challenge against a Tier 1 verdict within the challenge window.
+
+        Validates the challenge signature, ensures it references the prior verdict,
+        verifies the challenger is a party to the SLA, and enforces Ruling 16
+        (challenge must be issued within the window). Emits a `challenge_raised`
+        ledger event on success.
+
+        Raises:
+            SignatureError: challenge signature invalid.
+            VerdictError: challenge references wrong verdict or challenger is not
+                a counterparty.
+            ChallengeWindowError: challenge issued after the window elapsed.
         """
         ...
 

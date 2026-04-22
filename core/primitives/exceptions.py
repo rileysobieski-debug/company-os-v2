@@ -113,6 +113,23 @@ class ChallengeError(SettlementError):
     """
 
 
+class ChallengeWindowError(SettlementError):
+    """Raised when a challenge-window constraint is violated.
+
+    Three distinct cases share this type (callers inspect the message to
+    distinguish them):
+      - Challenge window still open: `release_pending_verdict` was called
+        on a Tier 1 verdict before the challenge window elapsed and no
+        challenge has been raised and resolved.
+      - Unresolved challenge blocks release: a `challenge_raised` event
+        exists for this verdict with no subsequent `challenge_resolved`
+        event, so the release cannot proceed.
+      - Challenge issued after window elapsed: `raise_challenge` was
+        called with an `issued_at` timestamp beyond the permitted window
+        (Ruling 16).
+    """
+
+
 class EvaluatorAuthorizationError(SettlementError):
     """An evaluator failed one or more authorization checks before scoring.
 
@@ -140,5 +157,6 @@ __all__ = [
     "SignatureError",
     "VerdictError",
     "ChallengeError",
+    "ChallengeWindowError",
     "EvaluatorAuthorizationError",
 ]

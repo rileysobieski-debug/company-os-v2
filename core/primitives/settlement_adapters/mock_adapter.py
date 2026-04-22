@@ -32,12 +32,14 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from core.primitives.asset import AssetRef
 from core.primitives.exceptions import (
+    ChallengeWindowError,
     EscrowStateError,
+    EvaluatorAuthorizationError,
     UnsupportedAssetError,
     VerdictError,
 )
@@ -430,7 +432,7 @@ class MockSettlementAdapter:
         record.status = "released"
 
     # ------------------------------------------------------------------
-    # release_pending_verdict (Ticket A5)
+    # release_pending_verdict (Ticket A5 + B3)
     # ------------------------------------------------------------------
     def release_pending_verdict(
         self,
@@ -440,12 +442,26 @@ class MockSettlementAdapter:
         expected_artifact_hash: str,
         requester_did: str,
         provider_did: str,
+        now: "datetime | None" = None,
+        challenge_window_sec: "int | None" = None,
+        expected_primary_evaluator_did: "str | None" = None,
+        expected_evaluator_canonical_hash: "str | None" = None,
     ) -> SettlementReceipt:
         """Settle an escrow based on a signed OracleVerdict.
 
         Enforces sla_id binding, signature validity, artifact hash binding,
         and double-verdict prevention. Emits verdict_issued (and optionally
-        founder_override) before the settlement event.
+        founder_override or challenge_resolved) before the settlement event.
+
+        For Tier 1 verdicts with challenge_window_sec set:
+          - Validates evaluator DID and canonical hash if expected values given.
+          - Blocks release if window is still open or unresolved challenge exists.
+
+        For Tier 3 verdicts with evidence.challenge_hash set:
+          - Emits challenge_resolved before the founder_override sequence.
+
+        Tier 0 verdicts: now / challenge_window_sec have no effect (backward compat).
+        Tier 1 verdicts without challenge_window_sec: released immediately (backward compat).
 
         Parameters
         ----------
@@ -461,6 +477,17 @@ class MockSettlementAdapter:
             recorded in ledger events).
         provider_did:
             DID of the provider (credited on acceptance).
+        now:
+            Override for "current time" used in window calculations. Defaults
+            to `datetime.now(timezone.utc)`. Only meaningful for Tier 1 verdicts
+            with challenge_window_sec set.
+        challenge_window_sec:
+            If set, enforces the challenge window for Tier 1 verdicts. Tier 0
+            and Tier 3 ignore this parameter.
+        expected_primary_evaluator_did:
+            If set, the verdict's evaluator_did must match this value.
+        expected_evaluator_canonical_hash:
+            If set, verdict.evidence["evaluator_canonical_hash"] must match.
 
         Returns
         -------
@@ -476,6 +503,11 @@ class MockSettlementAdapter:
             Cryptographic verification failed.
         EscrowStateError:
             Escrow not in `locked` state.
+        EvaluatorAuthorizationError:
+            Evaluator DID or canonical hash mismatch (Tier 1 only).
+        ChallengeWindowError:
+            Challenge window still open or unresolved challenge blocks release
+            (Tier 1 with challenge_window_sec only).
         """
         # --- guard: sla_id binding -----------------------------------------
         if verdict.sla_id != handle.ref:
@@ -518,7 +550,23 @@ class MockSettlementAdapter:
                         f"verdict already issued for sla_id {sla_id!r}"
                     )
 
-        # --- record is fetched for receipt construction below ---------------
+        # --- Tier 1: evaluator authorization checks (before recording) -----
+        # These are hard authorization failures -- do not emit any event.
+        if verdict.tier == 1 and challenge_window_sec is not None:
+            # 1. Evaluator DID check.
+            if expected_primary_evaluator_did is not None:
+                if verdict.evaluator_did != expected_primary_evaluator_did:
+                    raise EvaluatorAuthorizationError("evaluator DID mismatch")
+
+            # 2. Evaluator canonical hash check.
+            if expected_evaluator_canonical_hash is not None:
+                actual_hash = verdict.evidence.get("evaluator_canonical_hash")
+                if actual_hash != expected_evaluator_canonical_hash:
+                    raise EvaluatorAuthorizationError(
+                        "evaluator canonical hash drift"
+                    )
+
+        # --- record is fetched for amount/asset info below ------------------
         record = self.escrows.get(handle.handle_id)
         if record is None:
             raise EscrowStateError(
@@ -528,7 +576,9 @@ class MockSettlementAdapter:
         amount = record.handle.locked_amount
         asset = record.handle.asset
 
-        # --- emit verdict_issued event first --------------------------------
+        # --- emit verdict_issued event (before window checks) ---------------
+        # The verdict is recorded in the audit trail even if settlement is
+        # subsequently blocked by the challenge window or an unresolved challenge.
         verdict_meta: dict = {
             "verdict_hash": verdict.verdict_hash,
             "tier": verdict.tier,
@@ -549,6 +599,44 @@ class MockSettlementAdapter:
             metadata=dict(verdict_meta, requester_did=requester_did, provider_did=provider_did),
         )
 
+        # --- Tier 1 challenge-window checks (B3) -- after recording verdict --
+        # Window / unresolved-challenge checks run AFTER verdict_issued is emitted
+        # so the audit trail records the received verdict even when settlement blocks.
+        if verdict.tier == 1 and challenge_window_sec is not None:
+            # 3. Compute verdict expiry.
+            _effective_now = now if now is not None else datetime.now(timezone.utc)
+            verdict_issued_dt = datetime.fromisoformat(verdict.issued_at)
+            # Ensure timezone-awareness for comparison.
+            if verdict_issued_dt.tzinfo is None:
+                verdict_issued_dt = verdict_issued_dt.replace(tzinfo=timezone.utc)
+            verdict_expires_at = verdict_issued_dt + timedelta(
+                seconds=challenge_window_sec
+            )
+
+            # 4. Scan for unresolved challenges.
+            if self._ledger is not None:
+                ledger_events = list(self._ledger.events())
+                challenge_raised_events = [
+                    ev for ev in ledger_events
+                    if ev.kind == "challenge_raised"
+                    and ev.metadata.get("prior_verdict_hash") == verdict.verdict_hash
+                ]
+                for cr_ev in challenge_raised_events:
+                    ch_hash = cr_ev.metadata.get("challenge_hash", "")
+                    resolved = any(
+                        ev.kind == "challenge_resolved"
+                        and ev.metadata.get("challenge_hash") == ch_hash
+                        for ev in ledger_events
+                    )
+                    if not resolved:
+                        raise ChallengeWindowError(
+                            "unresolved challenge blocks release"
+                        )
+
+            # 5. Window still open check (only if no unresolved challenge found above).
+            if _effective_now < verdict_expires_at:
+                raise ChallengeWindowError("challenge window still open")
+
         # --- emit founder_override event for Tier 3 overrides ---------------
         if (
             verdict.tier == 3
@@ -565,6 +653,28 @@ class MockSettlementAdapter:
                     "founder_identity": verdict.evidence.get("founder_identity", ""),
                     "reason": verdict.evidence.get("reason", ""),
                     "overrides": verdict.evidence.get("overrides", ""),
+                },
+            )
+
+        # --- Tier 3 challenge supersede: emit challenge_resolved after founder_override ---
+        # Sequence: verdict_issued(t=3) -> founder_override -> challenge_resolved
+        #           -> release_from_verdict / slash_from_verdict / refund_from_verdict
+        challenge_hash_in_evidence = (
+            verdict.evidence.get("challenge_hash")
+            if verdict.tier == 3
+            else None
+        )
+        if challenge_hash_in_evidence:
+            self._record_event(
+                kind="challenge_resolved",
+                handle_id=str(handle.handle_id),
+                asset_id=asset.asset_id,
+                amount_quantity_str=str(amount.quantity),
+                sla_id=sla_id,
+                outcome_receipt=None,
+                metadata={
+                    "challenge_hash": challenge_hash_in_evidence,
+                    "resolved_by_verdict_hash": verdict.verdict_hash,
                 },
             )
 
@@ -644,6 +754,99 @@ class MockSettlementAdapter:
             )
 
         return receipt
+
+    # ------------------------------------------------------------------
+    # raise_challenge (B3)
+    # ------------------------------------------------------------------
+    def raise_challenge(
+        self,
+        handle: EscrowHandle,
+        challenge: Any,
+        *,
+        requester_did: str,
+        provider_did: str,
+        prior_verdict: Any,
+        challenge_window_sec: int,
+    ) -> None:
+        """Record a challenge against a Tier 1 verdict within the challenge window.
+
+        Validates the challenge, checks the challenger is a counterparty, enforces
+        Ruling 16 (challenge must be issued within the window), and emits a
+        `challenge_raised` ledger event.
+
+        Parameters
+        ----------
+        handle:
+            Escrow handle the challenge is associated with.
+        challenge:
+            A signed `Challenge` object.
+        requester_did:
+            DID of the requester (counterparty).
+        provider_did:
+            DID of the provider (counterparty).
+        prior_verdict:
+            The Tier 1 OracleVerdict being challenged.
+        challenge_window_sec:
+            The challenge window in seconds from the verdict's `issued_at`.
+
+        Raises
+        ------
+        SignatureError:
+            Challenge signature is invalid.
+        VerdictError:
+            Challenge references wrong verdict, or challenger is not a
+            counterparty to the SLA.
+        ChallengeWindowError:
+            Challenge issued after the window elapsed (Ruling 16).
+        """
+        # 1. Verify challenge signature.
+        challenge.verify_signature()  # raises SignatureError on tamper
+
+        # 2. Verify prior_verdict_hash binding.
+        if challenge.prior_verdict_hash != prior_verdict.verdict_hash:
+            raise VerdictError("challenge references wrong verdict")
+
+        # 3. Verify challenger is a counterparty.
+        if challenge.challenger_did not in (requester_did, provider_did):
+            raise VerdictError("unauthorized challenger")
+
+        # 4. Ruling 16: challenge must be issued within the window.
+        verdict_issued_dt = datetime.fromisoformat(prior_verdict.issued_at)
+        if verdict_issued_dt.tzinfo is None:
+            verdict_issued_dt = verdict_issued_dt.replace(tzinfo=timezone.utc)
+        window_end = verdict_issued_dt + timedelta(seconds=challenge_window_sec)
+
+        challenge_issued_dt = datetime.fromisoformat(challenge.issued_at)
+        if challenge_issued_dt.tzinfo is None:
+            challenge_issued_dt = challenge_issued_dt.replace(tzinfo=timezone.utc)
+
+        if challenge_issued_dt > window_end:
+            raise ChallengeWindowError("challenge issued after window elapsed")
+
+        # 5. Record challenge_raised event.
+        record = self.escrows.get(handle.handle_id)
+        if record is None:
+            raise EscrowStateError(
+                f"unknown escrow handle {handle.handle_id!r}"
+            )
+        amount = record.handle.locked_amount
+        asset = record.handle.asset
+
+        challenge_payload = challenge.to_dict()
+        self._record_event(
+            kind="challenge_raised",
+            handle_id=str(handle.handle_id),
+            asset_id=asset.asset_id,
+            amount_quantity_str=str(amount.quantity),
+            sla_id=handle.ref,
+            outcome_receipt=None,
+            metadata={
+                "challenge_hash": challenge.challenge_hash,
+                "prior_verdict_hash": challenge.prior_verdict_hash,
+                "challenger_did": challenge.challenger_did,
+                "challenge_payload": challenge_payload,
+            },
+        )
 
     # ------------------------------------------------------------------
     # Ledger wiring (Ticket 9)
