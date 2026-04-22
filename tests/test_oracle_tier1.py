@@ -44,7 +44,9 @@ _EVALUATOR_DID = "did:companyos:evaluator-alpha"
 _REQUESTER_DID = "did:companyos:requester-node"
 _PROVIDER_DID = "did:companyos:provider-node"
 _NODE_DID = "did:companyos:oracle-node-b2"
-_CANONICAL_HASH = "abc123deadbeef"
+# 64-char lowercase hex strings required by B0-d coupling validation.
+_CANONICAL_HASH = "abc123deadbeef" + "0" * 50  # 64 chars
+_EVALUATOR_PUBKEY_HEX = "ee" * 32              # 64 chars
 
 
 # ---------------------------------------------------------------------------
@@ -97,12 +99,18 @@ def _make_tier1_sla(
     artifact_bytes: bytes,
     *,
     schema_envelope: dict | None = None,
-    primary_evaluator_did: str = _EVALUATOR_DID,
+    primary_evaluator_did: str | None = _EVALUATOR_DID,
     canonical_evaluator_hash: str | None = _CANONICAL_HASH,
+    primary_evaluator_pubkey_hex: str = _EVALUATOR_PUBKEY_HEX,
     requester_node_did: str = _REQUESTER_DID,
     provider_node_did: str = _PROVIDER_DID,
 ) -> InterOrgSLA:
-    """Build a Tier 1 SLA with delivery hash bound."""
+    """Build a Tier 1 SLA with delivery hash bound.
+
+    All three Tier 1 evaluator fields (primary_evaluator_did,
+    canonical_evaluator_hash, primary_evaluator_pubkey_hex) must be
+    provided together per the B0-d coupling rule, or all omitted.
+    """
     if schema_envelope is None:
         schema_envelope = _valid_schema_envelope()
     sla = InterOrgSLA.create(
@@ -120,6 +128,7 @@ def _make_tier1_sla(
         expires_at="2026-04-28T00:00:00Z",
         primary_evaluator_did=primary_evaluator_did,
         canonical_evaluator_hash=canonical_evaluator_hash,
+        primary_evaluator_pubkey_hex=primary_evaluator_pubkey_hex,
     )
     artifact_hash = hashlib.sha256(artifact_bytes).hexdigest()
     return sla.with_delivery_hash(artifact_hash)
@@ -345,19 +354,22 @@ class TestTier1MechanicalGate:
 # ---------------------------------------------------------------------------
 class TestTier1Authorization:
     def test_canonical_hash_mismatch_raises(self, oracle: Oracle, usd: AssetRef):
+        # Use a 64-char hex string for the SLA field (B0-d coupling rule).
+        _correct_hash = "1" * 64
+        _wrong_hash = "2" * 64
         artifact = _valid_artifact()
         sla = _make_tier1_sla(
-            usd, artifact, canonical_evaluator_hash="correct-hash-abc"
+            usd, artifact, canonical_evaluator_hash=_correct_hash
         )
 
         wrong_hash_evaluator = StubPassthroughEvaluator(
             evaluator_did=_EVALUATOR_DID,
-            canonical_hash="wrong-hash-xyz",  # does NOT match SLA
+            canonical_hash=_wrong_hash,  # does NOT match SLA
             canned_output=EvaluationOutput(
                 result="accepted",
                 score=Decimal("0.9"),
                 evidence={"kind": "schema_pass_with_score"},
-                evaluator_canonical_hash="wrong-hash-xyz",
+                evaluator_canonical_hash=_wrong_hash,
             ),
         )
 
@@ -367,12 +379,37 @@ class TestTier1Authorization:
     def test_no_canonical_hash_on_sla_skips_check(
         self, oracle: Oracle, usd: AssetRef
     ):
-        """When canonical_evaluator_hash is None, the hash check is skipped."""
+        """When sla.canonical_evaluator_hash is absent (Tier 0 SLA), the hash
+        check is skipped and evaluate_tier1 runs without raising.
+
+        B0-d coupling rule prevents setting primary_evaluator_did without
+        canonical_evaluator_hash, so the "no hash" scenario is only
+        constructible as a fully Tier 0 SLA (all evaluator fields absent).
+        evaluate_tier1 does not itself enforce that the SLA be Tier 1.
+        """
         artifact = _valid_artifact()
-        sla = _make_tier1_sla(
-            usd, artifact, canonical_evaluator_hash=None
-        )
-        # Evaluator has any hash -- should not raise.
+        artifact_hash = hashlib.sha256(artifact).hexdigest()
+        # Tier 0 SLA: no evaluator fields set at all.
+        sla = InterOrgSLA.create(
+            sla_id="test-sla-no-hash-check",
+            requester_node_did=_REQUESTER_DID,
+            provider_node_did=_PROVIDER_DID,
+            task_scope="no hash check test",
+            deliverable_schema=_valid_schema_envelope(),
+            accuracy_requirement=0.8,
+            latency_ms=60_000,
+            payment=_make_money(usd),
+            penalty_stake=_make_money(usd),
+            nonce=InterOrgSLA.new_nonce(),
+            issued_at="2026-04-21T00:00:00Z",
+            expires_at="2026-04-28T00:00:00Z",
+            # primary_evaluator_did / canonical_evaluator_hash /
+            # primary_evaluator_pubkey_hex all absent (Tier 0 defaults)
+        ).with_delivery_hash(artifact_hash)
+        assert sla.canonical_evaluator_hash is None
+
+        # Evaluator has any hash string -- should not raise since the
+        # oracle skips the hash check when canonical_evaluator_hash is falsy.
         evaluator = StubPassthroughEvaluator(
             evaluator_did=_EVALUATOR_DID,
             canonical_hash="any-hash-at-all",

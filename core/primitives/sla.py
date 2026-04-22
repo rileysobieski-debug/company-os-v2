@@ -55,6 +55,7 @@ prefer `create`.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import dataclass, fields
 from datetime import datetime, timezone
@@ -267,6 +268,7 @@ class InterOrgSLA:
     artifact_hash_at_delivery: str = ""
     primary_evaluator_did: "str | None" = None
     canonical_evaluator_hash: "str | None" = None
+    primary_evaluator_pubkey_hex: str = ""
     challenge_window_sec: int = _CHALLENGE_WINDOW_SEC_DEFAULT
 
     requester_signature: "Signature | None" = None
@@ -296,6 +298,7 @@ class InterOrgSLA:
         artifact_hash_at_delivery: str = "",
         primary_evaluator_did: "str | None" = None,
         canonical_evaluator_hash: "str | None" = None,
+        primary_evaluator_pubkey_hex: str = "",
         challenge_window_sec: int = _CHALLENGE_WINDOW_SEC_DEFAULT,
     ) -> "InterOrgSLA":
         """Strict factory — validates inputs, normalizes timestamps,
@@ -340,6 +343,14 @@ class InterOrgSLA:
                 "artifact_hash_at_delivery must be a string "
                 "(empty string is permitted at signing time)"
             )
+        if not isinstance(primary_evaluator_pubkey_hex, str):
+            raise TypeError(
+                "primary_evaluator_pubkey_hex must be a string (empty string is "
+                "the Tier 0 default)"
+            )
+        # Explicit empty-string rejection for the str|None fields: an empty
+        # string is neither a valid DID/hash nor a valid "not set" sentinel
+        # (None is the canonical "not set" value for those fields).
         if primary_evaluator_did is not None and (
             not isinstance(primary_evaluator_did, str) or not primary_evaluator_did
         ):
@@ -347,11 +358,50 @@ class InterOrgSLA:
                 "primary_evaluator_did, when provided, must be a non-empty string"
             )
         if canonical_evaluator_hash is not None and (
-            not isinstance(canonical_evaluator_hash, str) or not canonical_evaluator_hash
+            not isinstance(canonical_evaluator_hash, str)
+            or not canonical_evaluator_hash
         ):
             raise ValueError(
                 "canonical_evaluator_hash, when provided, must be a non-empty string"
             )
+
+        # --- Tier 1 coupling validation (B0-d) ------------------------------
+        # All three evaluator identity fields must be set together or all
+        # left empty. Partial population is an error.
+        _tier1_fields_set = [
+            bool(primary_evaluator_did),
+            bool(canonical_evaluator_hash),
+            bool(primary_evaluator_pubkey_hex),
+        ]
+        if any(_tier1_fields_set) and not all(_tier1_fields_set):
+            raise ValueError(
+                "primary_evaluator_did, canonical_evaluator_hash, and "
+                "primary_evaluator_pubkey_hex must all be set together "
+                "(Tier 1 coupling) or all be left empty (Tier 0 default)."
+            )
+
+        if all(_tier1_fields_set):
+            # primary_evaluator_did: non-empty string (already guaranteed by
+            # bool() check above, but validate type explicitly)
+            if not isinstance(primary_evaluator_did, str) or not primary_evaluator_did:
+                raise ValueError(
+                    "primary_evaluator_did, when provided, must be a non-empty string"
+                )
+            # canonical_evaluator_hash: exactly 64 lowercase hex chars
+            if not isinstance(canonical_evaluator_hash, str) or not re.fullmatch(
+                r"[0-9a-f]{64}", canonical_evaluator_hash
+            ):
+                raise ValueError(
+                    "canonical_evaluator_hash must be exactly 64 lowercase hex "
+                    "characters when set"
+                )
+            # primary_evaluator_pubkey_hex: exactly 64 lowercase hex chars
+            if not re.fullmatch(r"[0-9a-f]{64}", primary_evaluator_pubkey_hex):
+                raise ValueError(
+                    "primary_evaluator_pubkey_hex must be exactly 64 lowercase hex "
+                    "characters (Ed25519 public key) when set"
+                )
+
         if not isinstance(challenge_window_sec, int) or isinstance(
             challenge_window_sec, bool
         ):
@@ -390,6 +440,7 @@ class InterOrgSLA:
             "artifact_hash_at_delivery": artifact_hash_at_delivery,
             "primary_evaluator_did": primary_evaluator_did,
             "canonical_evaluator_hash": canonical_evaluator_hash,
+            "primary_evaluator_pubkey_hex": primary_evaluator_pubkey_hex,
             "challenge_window_sec": challenge_window_sec,
         }
         body_bytes = _canonical_bytes_for_binding(shell)
@@ -424,6 +475,7 @@ class InterOrgSLA:
             artifact_hash_at_delivery=artifact_hash_at_delivery,
             primary_evaluator_did=primary_evaluator_did,
             canonical_evaluator_hash=canonical_evaluator_hash,
+            primary_evaluator_pubkey_hex=primary_evaluator_pubkey_hex,
             challenge_window_sec=challenge_window_sec,
             requester_signature=None,
             provider_signature=None,
@@ -663,6 +715,7 @@ class InterOrgSLA:
             "artifact_hash_at_delivery": self.artifact_hash_at_delivery,
             "primary_evaluator_did": self.primary_evaluator_did,
             "canonical_evaluator_hash": self.canonical_evaluator_hash,
+            "primary_evaluator_pubkey_hex": self.primary_evaluator_pubkey_hex,
             "challenge_window_sec": self.challenge_window_sec,
             "requester_signature": (
                 self.requester_signature.to_dict()
@@ -748,6 +801,9 @@ class InterOrgSLA:
                 str(canonical_eval_hash)
                 if canonical_eval_hash is not None
                 else None
+            ),
+            primary_evaluator_pubkey_hex=str(
+                d.get("primary_evaluator_pubkey_hex", "")
             ),
             challenge_window_sec=int(
                 d.get("challenge_window_sec", _CHALLENGE_WINDOW_SEC_DEFAULT)

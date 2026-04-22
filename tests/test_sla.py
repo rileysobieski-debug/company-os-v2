@@ -631,28 +631,34 @@ class TestV1aOracleFields:
         kwargs = _base_kwargs(usd)
         kwargs["primary_evaluator_did"] = "did:companyos:judge-001"
         kwargs["canonical_evaluator_hash"] = "a" * 64
+        kwargs["primary_evaluator_pubkey_hex"] = "b" * 64
         kwargs["challenge_window_sec"] = 3_600
         sla = InterOrgSLA.create(**kwargs)
         assert sla.primary_evaluator_did == "did:companyos:judge-001"
         assert sla.canonical_evaluator_hash == "a" * 64
+        assert sla.primary_evaluator_pubkey_hex == "b" * 64
         assert sla.challenge_window_sec == 3_600
 
         rehydrated = InterOrgSLA.from_dict(sla.to_dict(), registry)
         assert rehydrated.primary_evaluator_did == "did:companyos:judge-001"
         assert rehydrated.canonical_evaluator_hash == "a" * 64
+        assert rehydrated.primary_evaluator_pubkey_hex == "b" * 64
         assert rehydrated.challenge_window_sec == 3_600
 
     def test_v1b_fields_change_integrity_binding(self, usd):
-        """Adding primary_evaluator_did or canonical_evaluator_hash to an
+        """Adding the Tier 1 evaluator triplet or challenge_window_sec to an
         otherwise identical SLA deterministically changes the binding.
         Spec §A3: 'Adding ... changes integrity_binding (tested).'"""
         plain = InterOrgSLA.create(**_base_kwargs(usd))
 
-        with_pe = InterOrgSLA.create(
-            **dict(_base_kwargs(usd), primary_evaluator_did="did:x")
-        )
-        with_ch = InterOrgSLA.create(
-            **dict(_base_kwargs(usd), canonical_evaluator_hash="b" * 64)
+        # All three Tier 1 evaluator fields must be set together (coupling rule).
+        _tier1_extra = {
+            "primary_evaluator_did": "did:x",
+            "canonical_evaluator_hash": "a" * 64,
+            "primary_evaluator_pubkey_hex": "b" * 64,
+        }
+        with_tier1 = InterOrgSLA.create(
+            **dict(_base_kwargs(usd), **_tier1_extra)
         )
         with_cw = InterOrgSLA.create(
             **dict(_base_kwargs(usd), challenge_window_sec=7_200)
@@ -661,17 +667,16 @@ class TestV1aOracleFields:
         # Each variant must differ from plain and from each other.
         bindings = {
             plain.integrity_binding,
-            with_pe.integrity_binding,
-            with_ch.integrity_binding,
+            with_tier1.integrity_binding,
             with_cw.integrity_binding,
         }
-        assert len(bindings) == 4
+        assert len(bindings) == 3
 
-        # Deterministic: recreate with_pe with the same inputs, same binding.
-        with_pe_again = InterOrgSLA.create(
-            **dict(_base_kwargs(usd), primary_evaluator_did="did:x")
+        # Deterministic: recreate with_tier1 with the same inputs, same binding.
+        with_tier1_again = InterOrgSLA.create(
+            **dict(_base_kwargs(usd), **_tier1_extra)
         )
-        assert with_pe_again.integrity_binding == with_pe.integrity_binding
+        assert with_tier1_again.integrity_binding == with_tier1.integrity_binding
 
     def test_v1a_created_sla_self_verifies(self, usd):
         """A fresh v1a SLA (with all new-field defaults) must verify its
@@ -749,19 +754,21 @@ class TestV1aOracleFields:
             sla.with_delivery_hash(0xDEADBEEF)  # type: ignore[arg-type]
 
     def test_primary_evaluator_did_empty_string_rejected(self, usd):
+        # Empty string is not a valid DID; None is the canonical "not set".
         kwargs = _base_kwargs(usd)
         kwargs["primary_evaluator_did"] = ""
         with pytest.raises(ValueError, match="primary_evaluator_did"):
             InterOrgSLA.create(**kwargs)
 
     def test_canonical_evaluator_hash_empty_string_rejected(self, usd):
+        # Empty string is not a valid hash; None is the canonical "not set".
         kwargs = _base_kwargs(usd)
         kwargs["canonical_evaluator_hash"] = ""
         with pytest.raises(ValueError, match="canonical_evaluator_hash"):
             InterOrgSLA.create(**kwargs)
 
     def test_from_dict_defaults_for_missing_v1a_fields(self, usd, registry):
-        """A payload that pre-dates v1a and omits the four new fields
+        """A payload that pre-dates v1a/v1b and omits the optional fields
         still rehydrates; defaults fill in. This is what lets an old
         serialized SLA still load under the new schema.
         """
@@ -771,6 +778,7 @@ class TestV1aOracleFields:
             "artifact_hash_at_delivery",
             "primary_evaluator_did",
             "canonical_evaluator_hash",
+            "primary_evaluator_pubkey_hex",
             "challenge_window_sec",
         ):
             payload.pop(key, None)
@@ -778,4 +786,129 @@ class TestV1aOracleFields:
         assert rehydrated.artifact_hash_at_delivery == ""
         assert rehydrated.primary_evaluator_did is None
         assert rehydrated.canonical_evaluator_hash is None
+        assert rehydrated.primary_evaluator_pubkey_hex == ""
         assert rehydrated.challenge_window_sec == 86_400
+
+
+# ---------------------------------------------------------------------------
+# v1b oracle fields (Ticket B0-d) -- primary_evaluator_pubkey_hex
+# ---------------------------------------------------------------------------
+_FAKE_PUBKEY_HEX = "c" * 64  # 64 lowercase hex chars, valid Ed25519 width
+_FAKE_HASH_HEX = "a" * 64    # 64 lowercase hex chars, valid hash width
+
+
+class TestV1bEvaluatorCoupling:
+    """Tests for the Tier 1 evaluator coupling introduced in B0-d.
+
+    The three fields primary_evaluator_did, canonical_evaluator_hash, and
+    primary_evaluator_pubkey_hex must all be set together or all left at
+    their defaults (None / None / "").
+    """
+
+    def test_v1a_sla_default_pubkey_hex_is_empty_string(self, usd):
+        """v1a SLAs (no Tier 1 fields) construct unchanged; default is ''."""
+        sla = InterOrgSLA.create(**_base_kwargs(usd))
+        assert sla.primary_evaluator_pubkey_hex == ""
+        assert sla.primary_evaluator_did is None
+        assert sla.canonical_evaluator_hash is None
+
+    def test_full_tier1_sla_constructs_and_roundtrips(self, usd, registry):
+        """Full Tier-1-ready SLA (all three evaluator fields set) constructs
+        and roundtrips through to_dict / from_dict."""
+        kwargs = _base_kwargs(usd)
+        kwargs["primary_evaluator_did"] = "did:companyos:eval-001"
+        kwargs["canonical_evaluator_hash"] = _FAKE_HASH_HEX
+        kwargs["primary_evaluator_pubkey_hex"] = _FAKE_PUBKEY_HEX
+        sla = InterOrgSLA.create(**kwargs)
+        assert sla.primary_evaluator_did == "did:companyos:eval-001"
+        assert sla.canonical_evaluator_hash == _FAKE_HASH_HEX
+        assert sla.primary_evaluator_pubkey_hex == _FAKE_PUBKEY_HEX
+        assert sla.verify_binding() is True
+
+        d = sla.to_dict()
+        assert d["primary_evaluator_pubkey_hex"] == _FAKE_PUBKEY_HEX
+        rehydrated = InterOrgSLA.from_dict(d, registry)
+        assert rehydrated == sla
+        assert rehydrated.verify_binding() is True
+
+    def test_did_without_pubkey_hex_raises(self, usd):
+        """Setting primary_evaluator_did without primary_evaluator_pubkey_hex
+        raises ValueError (partial Tier 1 population)."""
+        kwargs = _base_kwargs(usd)
+        kwargs["primary_evaluator_did"] = "did:companyos:eval-001"
+        kwargs["canonical_evaluator_hash"] = _FAKE_HASH_HEX
+        # primary_evaluator_pubkey_hex left at default ""
+        with pytest.raises(ValueError, match="must all be set together"):
+            InterOrgSLA.create(**kwargs)
+
+    def test_did_without_canonical_hash_raises(self, usd):
+        """Setting primary_evaluator_did without canonical_evaluator_hash
+        raises ValueError (partial Tier 1 population)."""
+        kwargs = _base_kwargs(usd)
+        kwargs["primary_evaluator_did"] = "did:companyos:eval-001"
+        kwargs["primary_evaluator_pubkey_hex"] = _FAKE_PUBKEY_HEX
+        # canonical_evaluator_hash left at default None
+        with pytest.raises(ValueError, match="must all be set together"):
+            InterOrgSLA.create(**kwargs)
+
+    def test_pubkey_hex_wrong_length_raises(self, usd):
+        """primary_evaluator_pubkey_hex with length != 64 raises ValueError."""
+        kwargs = _base_kwargs(usd)
+        kwargs["primary_evaluator_did"] = "did:companyos:eval-001"
+        kwargs["canonical_evaluator_hash"] = _FAKE_HASH_HEX
+        kwargs["primary_evaluator_pubkey_hex"] = "ab" * 16  # 32 chars, too short
+        with pytest.raises(ValueError, match="primary_evaluator_pubkey_hex"):
+            InterOrgSLA.create(**kwargs)
+
+    def test_pubkey_hex_non_hex_chars_raises(self, usd):
+        """primary_evaluator_pubkey_hex with non-hex characters raises ValueError."""
+        kwargs = _base_kwargs(usd)
+        kwargs["primary_evaluator_did"] = "did:companyos:eval-001"
+        kwargs["canonical_evaluator_hash"] = _FAKE_HASH_HEX
+        # Replace last 4 chars with uppercase (not canonical hex)
+        kwargs["primary_evaluator_pubkey_hex"] = "c" * 60 + "ZZZZ"
+        with pytest.raises(ValueError, match="primary_evaluator_pubkey_hex"):
+            InterOrgSLA.create(**kwargs)
+
+    def test_pubkey_hex_uppercase_rejected(self, usd):
+        """Uppercase hex in primary_evaluator_pubkey_hex is not canonical form
+        and must be rejected."""
+        kwargs = _base_kwargs(usd)
+        kwargs["primary_evaluator_did"] = "did:companyos:eval-001"
+        kwargs["canonical_evaluator_hash"] = _FAKE_HASH_HEX
+        # Uppercase ABCDEF are valid hex digits but not lowercase-canonical.
+        kwargs["primary_evaluator_pubkey_hex"] = "A" * 64
+        with pytest.raises(ValueError, match="primary_evaluator_pubkey_hex"):
+            InterOrgSLA.create(**kwargs)
+
+    def test_integrity_binding_changes_when_pubkey_hex_changes(self, usd):
+        """integrity_binding changes deterministically when pubkey_hex changes."""
+        base_extra = {
+            "primary_evaluator_did": "did:companyos:eval-001",
+            "canonical_evaluator_hash": _FAKE_HASH_HEX,
+        }
+        sla_a = InterOrgSLA.create(
+            **dict(_base_kwargs(usd), **base_extra,
+                   primary_evaluator_pubkey_hex=_FAKE_PUBKEY_HEX)
+        )
+        sla_b = InterOrgSLA.create(
+            **dict(_base_kwargs(usd), **base_extra,
+                   primary_evaluator_pubkey_hex="d" * 64)
+        )
+        assert sla_a.integrity_binding != sla_b.integrity_binding
+
+        # Recreate sla_a: same pubkey_hex must produce the same binding.
+        sla_a2 = InterOrgSLA.create(
+            **dict(_base_kwargs(usd), **base_extra,
+                   primary_evaluator_pubkey_hex=_FAKE_PUBKEY_HEX)
+        )
+        assert sla_a2.integrity_binding == sla_a.integrity_binding
+
+    def test_from_dict_omitting_pubkey_hex_defaults_to_empty(self, usd, registry):
+        """A v1a payload (no primary_evaluator_pubkey_hex key) rehydrates
+        with the default empty string, preserving backward compat."""
+        sla = InterOrgSLA.create(**_base_kwargs(usd))
+        payload = sla.to_dict()
+        payload.pop("primary_evaluator_pubkey_hex", None)
+        rehydrated = InterOrgSLA.from_dict(payload, registry)
+        assert rehydrated.primary_evaluator_pubkey_hex == ""
