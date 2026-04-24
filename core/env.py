@@ -62,3 +62,33 @@ def load_env(path: Path = _ENV_PATH) -> dict[str, str]:
             os.environ[key] = value
             loaded[key] = value
     return loaded
+
+
+class MissingRequiredEnv(RuntimeError):
+    """Raised at startup when a required environment variable is missing or
+    empty. Callers catch this at the boot path and exit with a clear error
+    rather than failing later on the first LLM call."""
+
+
+def validate_runtime_environment(
+    required: tuple[str, ...] = ("ANTHROPIC_API_KEY",),
+) -> None:
+    """Fail fast if any `required` env var is unset or empty.
+
+    Intended to be called once at the top of a long-running process (webapp
+    boot, CLI dispatch, scheduled task). `load_env()` should run first so
+    `.env`-sourced values are visible.
+
+    Silent absence of ANTHROPIC_API_KEY currently surfaces as an opaque
+    anthropic SDK error on the first `messages.create()` call, which can be
+    minutes of wall clock time into a long dispatch. Catching it at boot
+    lets the operator correct before any job starts.
+    """
+    missing = [name for name in required if not os.environ.get(name)]
+    if missing:
+        joined = ", ".join(missing)
+        raise MissingRequiredEnv(
+            "Required environment variable(s) missing or empty: "
+            f"{joined}. Set them in ~/.company-os/.env or the process "
+            "environment before starting. See docs/runbook-webapp.md.",
+        )

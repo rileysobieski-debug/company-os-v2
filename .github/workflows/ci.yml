@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - 'feature/**'
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test:
+    name: pytest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Install dependencies from requirements.lock
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --require-hashes -r requirements.lock
+
+      - name: Run pytest
+        env:
+          # No COMPANY_OS_VAULT_DIR is set in CI. Vault-dependent tests use
+          # the vault_dir fixture in tests/conftest.py, which calls
+          # pytest.skip when the env var is missing. That is the intended CI
+          # shape: 1313 pass, 4 xfail (known pre-existing), 61 skip (vault-
+          # dependent), 1 skip (symlink on platforms without SeCreateSymbolicLink
+          # which does not apply to ubuntu but is here for documentation).
+        run: |
+          python -m pytest tests/ -v --tb=short
+
+      - name: Report test counts
+        if: always()
+        run: |
+          python -m pytest tests/ --collect-only -q 2>/dev/null | tail -1 || true

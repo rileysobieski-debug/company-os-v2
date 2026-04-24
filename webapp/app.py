@@ -4315,6 +4315,13 @@ def main() -> None:
 
     _configure_logging()
 
+    from core.env import MissingRequiredEnv, validate_runtime_environment
+    try:
+        validate_runtime_environment()
+    except MissingRequiredEnv as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(2)
+
     print("=" * 60)
     print(f"  Company OS — Web GUI")
     print(f"  http://{args.host}:{args.port}")

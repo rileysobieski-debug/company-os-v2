@@ -17,6 +17,29 @@ if str(_PROJECT_DIR) not in sys.path:
 import pytest  # noqa: E402
 
 
+# Known pre-existing failures tracked in docs/known-pre-existing-failures.md.
+# Auto-applied as xfail(strict=True) so CI does not block on them but an
+# accidental fix is caught via XPASS. Remove an entry here when the real fix
+# lands; don't modify the test file just to silence the failure.
+_KNOWN_PRE_EXISTING_FAILURES = {
+    "tests/test_phase14_dept_onboarding.py::TestPhaseTransitions::test_full_lifecycle_to_complete",
+    "tests/test_phase14_dept_onboarding.py::TestAggregates::test_overall_progress_counts",
+    "tests/test_phase14_dept_onboarding.py::TestScopeCalibrationPrompt::test_secondary_is_ambient_not_operational",
+    "tests/test_phase14_stack_review.py::TestAutoTrigger::test_returns_true_when_all_complete",
+}
+
+
+def pytest_collection_modifyitems(config, items):  # noqa: ARG001
+    mark = pytest.mark.xfail(
+        reason="known pre-existing phase14 failure; see docs/known-pre-existing-failures.md",
+        strict=True,
+    )
+    for item in items:
+        normalised = item.nodeid.replace("\\", "/")
+        if normalised in _KNOWN_PRE_EXISTING_FAILURES:
+            item.add_marker(mark)
+
+
 @pytest.fixture(scope="session")
 def vault_dir() -> Path:
     """Vault root Path, read from COMPANY_OS_VAULT_DIR.

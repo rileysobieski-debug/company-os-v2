@@ -35,6 +35,45 @@ def test_env_loader_missing_file_returns_empty(tmp_path: Path) -> None:
     assert result == {}
 
 
+def test_validate_runtime_environment_passes_when_set(monkeypatch) -> None:
+    from core.env import validate_runtime_environment
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake")
+    validate_runtime_environment()
+
+
+def test_validate_runtime_environment_raises_on_missing(monkeypatch) -> None:
+    from core.env import MissingRequiredEnv, validate_runtime_environment
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    with pytest.raises(MissingRequiredEnv):
+        validate_runtime_environment()
+
+
+def test_validate_runtime_environment_raises_on_empty(monkeypatch) -> None:
+    from core.env import MissingRequiredEnv, validate_runtime_environment
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "")
+    with pytest.raises(MissingRequiredEnv):
+        validate_runtime_environment()
+
+
+def test_validate_runtime_environment_custom_required_set(monkeypatch) -> None:
+    from core.env import MissingRequiredEnv, validate_runtime_environment
+    monkeypatch.delenv("FAKE_CUSTOM_VAR", raising=False)
+    with pytest.raises(MissingRequiredEnv) as excinfo:
+        validate_runtime_environment(required=("FAKE_CUSTOM_VAR",))
+    assert "FAKE_CUSTOM_VAR" in str(excinfo.value)
+
+
+def test_validate_runtime_environment_lists_all_missing(monkeypatch) -> None:
+    from core.env import MissingRequiredEnv, validate_runtime_environment
+    monkeypatch.delenv("FAKE_ONE", raising=False)
+    monkeypatch.delenv("FAKE_TWO", raising=False)
+    with pytest.raises(MissingRequiredEnv) as excinfo:
+        validate_runtime_environment(required=("FAKE_ONE", "FAKE_TWO"))
+    message = str(excinfo.value)
+    assert "FAKE_ONE" in message
+    assert "FAKE_TWO" in message
+
+
 def test_env_loader_strips_quotes(monkeypatch, tmp_path: Path) -> None:
     from core.env import load_env
     monkeypatch.delenv("FAKE_QUOTED_KEY", raising=False)
