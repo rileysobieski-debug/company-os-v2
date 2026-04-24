@@ -57,12 +57,68 @@ from __future__ import annotations
 
 import json
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Literal, Optional
 
 LEDGER_FILENAME = "events.jsonl"
+
+
+@contextmanager
+def _interprocess_lock(lock_path: Path) -> Iterator[None]:
+    """Best-effort cross-process advisory lock. Opens `lock_path` and
+    takes an exclusive lock via `fcntl.flock` (POSIX) or
+    `msvcrt.locking` (Windows). Falls back to a no-op on platforms
+    that support neither so a test environment without file-locking
+    primitives still runs.
+
+    The caller MUST also hold an intra-process `threading.Lock` for
+    the same ledger; this helper only defends against OTHER processes.
+    """
+    fh = None
+    locked_mode = "none"
+    try:
+        fh = lock_path.open("a+b")
+        try:
+            import fcntl  # type: ignore[import-not-found]
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            locked_mode = "fcntl"
+        except (ImportError, OSError, AttributeError):
+            try:
+                import msvcrt  # type: ignore[import-not-found]
+                import time
+                for _ in range(60):
+                    try:
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+                        locked_mode = "msvcrt"
+                        break
+                    except OSError:
+                        time.sleep(0.1)
+            except (ImportError, OSError, AttributeError):
+                locked_mode = "none"
+        try:
+            yield
+        finally:
+            try:
+                if locked_mode == "fcntl":
+                    import fcntl  # type: ignore[import-not-found]
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                elif locked_mode == "msvcrt":
+                    import msvcrt  # type: ignore[import-not-found]
+                    try:
+                        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                    except OSError:
+                        pass
+            except Exception:
+                pass
+    finally:
+        if fh is not None:
+            try:
+                fh.close()
+            except OSError:
+                pass
 
 EventKind = Literal[
     "lock",
@@ -227,6 +283,13 @@ class SettlementEventLedger:
     def __init__(self, ledger_dir: Path) -> None:
         self.ledger_dir = Path(ledger_dir)
         self.ledger_dir.mkdir(parents=True, exist_ok=True)
+        # Intra-process write lock. Closes the parallel-write race where
+        # two managers both read-existing-bytes + append + rename at the
+        # same instant and one event is silently overwritten. An
+        # interprocess flock wraps this in `record()` for multi-process
+        # deployments.
+        import threading
+        self._write_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Paths
@@ -243,39 +306,45 @@ class SettlementEventLedger:
     # ------------------------------------------------------------------
     def record(self, event: SettlementEvent) -> None:
         """Append `event` to the ledger. Never overwrites an existing
-        JSONL tail — the append is snapshot-then-rename-atomic: if the
-        rename fails, `events.jsonl` remains exactly as it was before
-        the call. Per-event markdown is written after the JSONL rename
-        succeeds."""
+        JSONL tail. The read-existing + append + rename sequence runs
+        inside two overlapping locks so parallel `record` calls cannot
+        silently overwrite each other:
+
+            1. `self._write_lock` (threading.Lock) blocks intra-process
+               concurrent writers.
+            2. A best-effort file lock on a sibling `.events.lock`
+               file blocks inter-process concurrent writers via flock
+               on POSIX, msvcrt on Windows, or no-op on platforms that
+               support neither. The intra-process lock is always in
+               force regardless.
+
+        If the rename fails, `events.jsonl` remains exactly as it was
+        before the call. Per-event markdown is written after the JSONL
+        rename succeeds.
+        """
         line = event.to_canonical_json() + "\n"
         target = self.jsonl_path
         tmp = target.with_suffix(target.suffix + ".tmp")
+        lock_path = self.ledger_dir / ".events.lock"
 
-        existing = b""
-        if target.exists():
-            existing = target.read_bytes()
+        with self._write_lock, _interprocess_lock(lock_path):
+            existing = b""
+            if target.exists():
+                existing = target.read_bytes()
 
-        with tmp.open("wb") as f:
-            if existing:
-                f.write(existing)
-            f.write(line.encode("utf-8"))
-            f.flush()
-            # fsync best-effort; Windows can surface EINVAL on some FDs
-            # depending on the file system, so we swallow it rather than
-            # mask the atomic guarantee.
-            try:
-                import os
-                os.fsync(f.fileno())
-            except (OSError, AttributeError):
-                pass
+            with tmp.open("wb") as f:
+                if existing:
+                    f.write(existing)
+                f.write(line.encode("utf-8"))
+                f.flush()
+                try:
+                    import os
+                    os.fsync(f.fileno())
+                except (OSError, AttributeError):
+                    pass
 
-        # Atomic swap — this is the single point of failure the caller
-        # cares about. If it raises, `target` is untouched.
-        tmp.replace(target)
+            tmp.replace(target)
 
-        # Markdown companion — separate file, does not affect JSONL
-        # atomicity. If this fails, the JSONL is still correct; the
-        # exception propagates so tests and callers notice.
         md = self.md_path(event.event_id)
         md.write_text(_render_md(event), encoding="utf-8")
 

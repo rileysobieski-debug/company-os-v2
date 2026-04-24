@@ -338,3 +338,87 @@ def test_mock_principals_are_blank_by_default(asset_registry, tmp_path: Path):
     }
     # Locker name lands in metadata, not in principals.
     assert event.metadata.get("locker") == "alice"
+
+
+# ---------------------------------------------------------------------------
+# Concurrency: parallel-write race (Gemini round-4 finding)
+# ---------------------------------------------------------------------------
+import threading
+
+
+def test_concurrent_record_no_event_loss(tmp_path):
+    """Two threads each record N events. After both finish, the ledger
+    must contain exactly 2N events. Before the intra-process
+    threading.Lock shipped alongside this test, one thread's events
+    were silently overwritten by the other's snapshot-then-rename."""
+    from core.primitives.settlement_ledger import SettlementEvent, SettlementEventLedger
+
+    ledger = SettlementEventLedger(tmp_path)
+    N = 30
+    barrier = threading.Barrier(2)
+
+    def worker(prefix: str) -> None:
+        barrier.wait()
+        for i in range(N):
+            ledger.record(SettlementEvent(
+                kind="lock",
+                handle_id=f"{prefix}-{i}",
+                asset_id="USDC",
+                amount_quantity_str="1.000000",
+            ))
+
+    t1 = threading.Thread(target=worker, args=("a",))
+    t2 = threading.Thread(target=worker, args=("b",))
+    t1.start(); t2.start(); t1.join(); t2.join()
+
+    with ledger.jsonl_path.open("r", encoding="utf-8") as fh:
+        lines = [ln for ln in fh.read().splitlines() if ln.strip()]
+    assert len(lines) == 2 * N, (
+        f"expected {2*N} events, saw {len(lines)}; race condition present"
+    )
+
+
+def test_concurrent_record_preserves_all_handle_ids(tmp_path):
+    """Stronger invariant: every handle_id issued by either thread
+    appears in the final ledger. Lost events would show up as a
+    missing id, not just a wrong count."""
+    from core.primitives.settlement_ledger import SettlementEvent, SettlementEventLedger
+
+    ledger = SettlementEventLedger(tmp_path)
+    N = 20
+    barrier = threading.Barrier(4)
+    expected_ids: set[str] = set()
+    ids_lock = threading.Lock()
+
+    def worker(prefix: str) -> None:
+        barrier.wait()
+        for i in range(N):
+            hid = f"{prefix}-{i:03d}"
+            with ids_lock:
+                expected_ids.add(hid)
+            ledger.record(SettlementEvent(
+                kind="lock",
+                handle_id=hid,
+                asset_id="USDC",
+                amount_quantity_str="1.000000",
+            ))
+
+    threads = [threading.Thread(target=worker, args=(p,)) for p in ("a", "b", "c", "d")]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    seen_ids: set[str] = set()
+    with ledger.jsonl_path.open("r", encoding="utf-8") as fh:
+        import json as _json
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            obj = _json.loads(line)
+            seen_ids.add(obj["handle_id"])
+    assert seen_ids == expected_ids, (
+        f"missing from ledger: {sorted(expected_ids - seen_ids)}; "
+        f"extra in ledger: {sorted(seen_ids - expected_ids)}"
+    )
