@@ -1,15 +1,10 @@
-"""Pre-kernel adversarial harness: SafePath containment.
+"""Adversarial test suite: SafePath containment (Walls layer).
 
-Week 1 plan item. Intentionally runnable against the Week 2-3 stub so
-the test design surfaces before implementation. Expected state:
-
-  - With the stub: all containment tests xfail (SafePath.resolve
-    raises NotImplementedError).
-  - After Week 2-3: the `strict=True` xfail markers flip to pass,
-    and CI flags if any adversarial probe slips through.
-
-The attacks tested here are intentionally nasty. Shallow tests (only
-`..`) are not enough; the reviewer demanded adversarial coverage.
+Started Week 1 as a pre-kernel harness (xfail-strict against the stub).
+Week 2 Day 1 landed the real SafePath; xfail markers have been removed
+and this file is now the live regression suite for tenant path
+containment. Every probe here was chosen by the v6 reviewer round as a
+known attack vector; keep them even if they feel redundant.
 """
 from __future__ import annotations
 
@@ -49,11 +44,6 @@ _ATTACK_VECTORS = [
 ]
 
 
-@pytest.mark.xfail(
-    reason="SafePath.resolve is a Week 2-3 deliverable; stub raises NotImplementedError",
-    strict=True,
-    raises=NotImplementedError,
-)
 @pytest.mark.parametrize("vector", _ATTACK_VECTORS)
 def test_attack_vectors_raise_breach(tenant_root, vector):
     sp = SafePath(tenant_root)
@@ -61,11 +51,6 @@ def test_attack_vectors_raise_breach(tenant_root, vector):
         sp.resolve(vector)
 
 
-@pytest.mark.xfail(
-    reason="SafePath.resolve is a Week 2-3 deliverable",
-    strict=True,
-    raises=NotImplementedError,
-)
 def test_legit_relative_path_resolves_inside_root(tenant_root):
     sp = SafePath(tenant_root)
     resolved = sp.resolve("allowed.txt")
@@ -73,11 +58,6 @@ def test_legit_relative_path_resolves_inside_root(tenant_root):
     assert Path(resolved).resolve().is_relative_to(tenant_root.resolve())
 
 
-@pytest.mark.xfail(
-    reason="SafePath.resolve is a Week 2-3 deliverable",
-    strict=True,
-    raises=NotImplementedError,
-)
 def test_symlink_to_outside_root_blocked(tmp_path, tenant_root):
     outside = tmp_path / "sibling" / "secret.txt"
     link = tenant_root / "evil-link"
@@ -93,11 +73,6 @@ def test_symlink_to_outside_root_blocked(tmp_path, tenant_root):
 # ---------------------------------------------------------------------------
 # Property-based: fuzz random byte-ish paths, none should escape
 # ---------------------------------------------------------------------------
-@pytest.mark.xfail(
-    reason="SafePath.resolve is a Week 2-3 deliverable",
-    strict=True,
-    raises=NotImplementedError,
-)
 @settings(suppress_health_check=[HealthCheck.function_scoped_fixture])
 @given(
     st.text(
@@ -113,3 +88,38 @@ def test_fuzz_never_escapes_root(tenant_root, candidate):
     except (SovereignBreach, ValueError, OSError):
         return
     assert Path(resolved).resolve().is_relative_to(tenant_root.resolve())
+
+
+# ---------------------------------------------------------------------------
+# Constructor-time invariants
+# ---------------------------------------------------------------------------
+def test_constructor_rejects_nonexistent_root(tmp_path):
+    with pytest.raises(SovereignBreach):
+        SafePath(tmp_path / "does-not-exist")
+
+
+def test_root_property_returns_resolved_absolute_path(tenant_root):
+    sp = SafePath(tenant_root)
+    assert sp.root == tenant_root.resolve()
+    assert sp.root.is_absolute()
+
+
+def test_resolve_accepts_pathlib_input(tenant_root):
+    sp = SafePath(tenant_root)
+    resolved = sp.resolve(Path("allowed.txt"))
+    assert resolved == (tenant_root / "allowed.txt").resolve()
+
+
+def test_resolve_rejects_null_byte_in_pathlib_input(tenant_root):
+    sp = SafePath(tenant_root)
+    with pytest.raises(SovereignBreach):
+        sp.resolve("allowed.txt\x00")
+
+
+def test_resolve_allows_nested_subdir(tenant_root):
+    nested = tenant_root / "subdir" / "nested"
+    nested.mkdir(parents=True)
+    (nested / "note.md").write_text("nested", encoding="utf-8")
+    sp = SafePath(tenant_root)
+    resolved = sp.resolve("subdir/nested/note.md")
+    assert resolved.read_text(encoding="utf-8") == "nested"
